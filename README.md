@@ -1,49 +1,117 @@
-# 26ICT1011P1-O
-ICT1011 Team Exploration Project
-Project concept: GestureKey, a wrist-worn challenge-response door lock
-A TinyScreen+ acts as a physical authenticator. You unlock a door by performing a secret wrist gesture (a motion "password") and approving a challenge on the OLED. The TinyScreen+ and a Raspberry Pi-controlled lock then complete a cryptographic handshake over BLE, so it isn't just a static code.
-I chose a security theme because it gives you a strong story for the Creativity rubric. It also forces real programming on more than one platform, which is what the Technical rubric rewards.
+# GestureKey
 
-How it works
-1. The Raspberry Pi (BLE central, next to the lock) sends a random challenge to the TinyScreen+.
-2. The watch shows "Unlock? Perform gesture" on the OLED.
-3. The wearer performs a secret gesture (for example flick, flick, tilt). The accelerometer data is matched against the stored gesture template on the watch.
-4. If the gesture matches, the watch computes a response (HMAC of the challenge with a shared key) and sends it back over BLE.
-5. The Pi verifies the response, drives a servo to unlock, and logs the event (success, failure, timestamp).
-6. After 3 failed attempts the Pi locks out for a period, and the watch shows an alert.
-7. A small web dashboard on the Pi shows the live access log.
+A wrist-worn challenge-response door lock built for the ICT1011 Team Exploration Project.
+A TinyScreen+ watch asks the wearer for a secret wrist gesture, then proves it to a
+Raspberry Pi over Bluetooth Low Energy using HMAC-SHA256. The Pi drives a servo lock,
+logs every attempt and enforces a lockout after repeated failures.
 
-Mapping to the rubric
-I could only see part of the rubric table, so I'm assuming the rightmost column is the top band. The visible text of the lower bands already shows what to avoid.
-Criterion
-What the lower bands penalise
-What GestureKey does for top marks
-Creativity (5)
-Copies of Lab 4, simple re-implementations, or cases "found online"
-A security-focused wearable with gesture auth and challenge-response is not a stock smartwatch or Flappy Bird variant. The 3D-printed lock mechanism also shows it isn't "just a watch" (the briefing says the application need not be a watch).
-Technical (5)
-Unmodified code, or a single platform with light changes
-Original firmware on the TinyScreen+ (gesture matching, HMAC, BLE protocol, UI), plus a Raspberry Pi service (BLE client, verification, servo control, Flask dashboard). That is multiple platforms with significant programming on at least one, which is the top band's wording.
-YouTube (5)
-Minimal demo, no evidence of effort
-Clear big picture (the problem with keys and PINs), a live demo including a failed attempt and lockout, distribution of work, and citations of sources. Keep it to 2–3 minutes.
-Demonstration (5)
-Partial or minimal working
-Fully working end to end on 26 Nov, with a rehearsed script and a fallback plan (see risks).
+> Prototype for coursework, not production security. See "Limitations".
 
-Materials
-Already in your kit: TinyScreen+, accelerometer board, BLE expansion board, 3.7V 150mAh battery, micro-USB cable.
+## How it works
+1. Pi sends `'C'` + 16 random bytes (the challenge) to the watch.
+2. Watch wakes and asks for 3 flicks. Progress is shown as dots only.
+3. If the gesture matches, the watch replies `'R'` + first 16 bytes of
+   `HMAC-SHA256(key, 'A' + nonce)`. Otherwise it replies `'N'`.
+4. Pi verifies the HMAC, unlocks the servo, and logs the result.
+5. After 3 failures the Pi locks out for 30 s and sends `'L'` to the watch.
 
-Likely extras (check what's available):
-Raspberry Pi with Bluetooth (a Pi 3, 4 or Zero 2 W works) and a microSD card
-Small hobby servo (SG90 or similar) and jumper wires
-5V supply for the Pi and servo
-3D-printed parts: watch case or strap mount, and a servo bracket or latch model (the briefing says you'll have some 3D printer access)
-Optional: a TinyCircuits buzzer or vibration/haptic shield for feedback on a wrong gesture. I couldn't see the contents of the TinyCircuit_Accessories_Oct26 deck, so check there for what's actually offered.
+## Repository layout
+```
+GestureKey/            Arduino sketch for the TinyScreen+ (open GestureKey.ino)
+  GestureKey.ino       state machine, gesture detection, BLE protocol
+  UART.ino             BLE UART service (adapted from TinyCircuits example)
+  BMA250.h/.cpp        accelerometer driver (TinyCircuits)
+  gk_crypto.h          SHA-256 + HMAC (FIPS 180-4 / RFC 2104)
+  secrets.h            shared key  -- NOT in git, see below
+pi/
+  gk_lock.py           BLE client, verifier, lockout, servo, logging
+  dashboard.py         Flask page showing the access log
+  gk_key.txt           shared key (hex) -- NOT in git
+```
 
-Software and libraries:
-Arduino IDE with the TinyCircuits board support and the TinyScreen+ library
-The nRF8001 BLE library used by the TinyCircuits BLE board and the examples in the LMS zips
-A lightweight SHA-256/HMAC library for Arduino/SAMD21
-On the Pi: Python 3, a BLE library (bleak or bluepy), Flask, and gpiozero or pigpio for servo control
-GitHub for version control, which also helps with the work-distribution evidence
+## Hardware
+- TinyScreen+ with accelerometer board and BLE (ST) board, 3.7 V battery, micro-USB cable
+- Raspberry Pi with Bluetooth, plus a hobby servo (signal on GPIO 18)
+- 3D-printed lock bracket and watch mount
+
+## Setup
+
+### Watch
+1. Install the Arduino IDE.
+2. Follow the TinyScreen+ setup tutorial linked in the Lab 4 manual
+   (TinyCircuits board package and drivers; select the TinyScreen+ board).
+3. Install the libraries used by the lab examples: TinyScreen and the ST BLE library
+   (provides `STBLE.h`). Take them from `TinyCircuit_Examples.zip` on the LMS if needed.
+4. Create `GestureKey/secrets.h` (see Secrets).
+5. In `UART.ino`, change the last byte of `bdaddr` so your watch is unique in the lab.
+6. Open `GestureKey/GestureKey.ino`, select the board and port, Upload.
+
+### Raspberry Pi
+```
+pip install bleak gpiozero pigpio flask
+python3 pi/gk_lock.py        # press Enter to request an unlock
+python3 pi/dashboard.py      # log page on http://<pi-ip>:5000
+```
+
+## Secrets
+`secrets.h` and `pi/gk_key.txt` hold the same 16-byte key and are git-ignored.
+Generate a key and share it with teammates privately (not via GitHub):
+```
+python3 -c "import os;print(os.urandom(16).hex())"
+```
+`gk_key.txt` holds the hex string; `secrets.h` holds the same bytes as a C array.
+
+## Tuning the gesture
+Set `TUNE_MODE true` in `GestureKey.ino`, open the Serial Monitor, and watch the values
+while flicking. Adjust `FLICK_THRESHOLD` and `REFRACTORY_MS` until detection is reliable.
+Default gesture: X+, X+, Y-. Re-record with the upper-left button within 60 s of power-up.
+
+## Limitations
+- Gesture is stored in RAM only and resets on power cycle.
+- Anyone with physical access can power-cycle the watch and re-enrol.
+- Protects against replayed responses and brute-force guessing at the Pi;
+  does not defend against a stolen watch whose owner is coerced, or a compromised Pi.
+
+## Team and contributions
+| Member | Area |
+|---|---|
+| | Watch UI and firmware |
+| | Gesture engine |
+| | Crypto and BLE protocol |
+| | Pi backend |
+| | Hardware and 3D printing |
+| | Dashboard, video, submission |
+
+Commit your own work under your own name so the history shows who did what.
+
+## References
+Background reading for the design. These are cited for ideas only; none of their code is used.
+
+**HMAC and hashing**
+- H. Krawczyk, M. Bellare, R. Canetti, *HMAC: Keyed-Hashing for Message Authentication*,
+  RFC 2104, 1997. https://www.rfc-editor.org/info/rfc2104
+- NIST, *Secure Hash Standard (SHS)*, FIPS 180-4 (specification used for `gk_crypto.h`).
+
+**Challenge-response and replay attacks**
+- UPenn CIS 551 lecture notes, *Authentication protocols* (nonces and replay).
+  https://www.cis.upenn.edu/~stevez/cis551/2007/web/lectures/CIS551-17.pdf
+- JumpCloud, *What Is Challenge Response Authentication?* (explainer).
+  https://jumpcloud.com/it-index/what-is-challenge-response-authentication
+
+**Wrist-motion authentication research** (behavioural biometrics; GestureKey instead uses a
+secret flick sequence, so these are context, not a claim of equivalence)
+- A. Buriro et al., *AirSign: A Gesture-Based Smartwatch User Authentication*, ICCST 2018.
+  https://repository.essex.ac.uk/40839/
+- M. Eskandari et al., *SnapAuth: A Gesture-Based Unobtrusive Smartwatch User Authentication
+  Scheme*, 2018. https://cris.fbk.eu/handle/11582/315865
+- F. Kerber, P. Schardt, M. Loechtefeld, *WristRotate: A Personalized Motion Gesture Delimiter
+  for Wrist-Worn Devices*, MUM 2015.
+  https://www.dfki.de/web/forschung/projekte-publikationen/publikation/8163
+
+## Attribution
+- BLE UART service and example structure: TinyCircuits ST BLE SmartWatch example
+- BMA250 driver and TinyScreen library: TinyCircuits
+- Accelerometer polling pattern: TinyScreen_FlappyBirds_accelero example
+- SHA-256 / HMAC: implemented from FIPS 180-4 and RFC 2104
+- BLE on the Pi: `bleak`; servo: `gpiozero`; dashboard: Flask
+- Add any further code you adapt here and in the source file headers.
