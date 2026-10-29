@@ -24,10 +24,9 @@ NUS_WRITE  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"    # watch receives challeng
 NUS_NOTIFY = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"    # watch sends responses here
 KEY = bytes.fromhex(open(os.path.join(os.path.dirname(__file__), "gk_key.txt")).read().strip())
 
-RESPONSE_TIMEOUT_S = float(os.environ.get("GK_TIMEOUT", 10))   # watch allows ~8 s for the gesture; for testing run: GK_TIMEOUT=600 python3 gk_lock.py
+RESPONSE_TIMEOUT_S = 10      # watch allows ~8 s for the gesture
 MAX_FAILS = 3
 LOCKOUT_S = 30
-TEST_NO_LOCKOUT = True      # testing: wrong gestures never lock you out. Set False for the real demo
 UNLOCK_HOLD_S = 5
 SERVO_PIN = 18
 LOG_FILE = os.path.join(os.path.dirname(__file__), "access_log.jsonl")
@@ -99,9 +98,7 @@ async def attempt(client):
     else:
         fails += 1
         log("fail", f"{why} ({fails}/{MAX_FAILS})")
-        if fails >= MAX_FAILS and TEST_NO_LOCKOUT:
-            fails = 0                         # testing: keep the counter from running past 3, no lockout
-        elif fails >= MAX_FAILS:
+        if fails >= MAX_FAILS:
             locked_until = time.time() + LOCKOUT_S
             fails = 0
             log("lockout", f"{LOCKOUT_S} s")
