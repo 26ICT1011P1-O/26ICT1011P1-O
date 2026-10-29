@@ -82,6 +82,35 @@ Default gesture: X+, X+, Y-. Re-record with the upper-left button within 60 s of
 | | Hardware and 3D printing |
 | | Dashboard, video, submission |
 
+## Unlock method: scrambled button keypad
+
+The watch is unlocked with its four physical buttons (the TinyScreen+ screen is not
+touch). Instead of a fixed PIN pad, the watch shows four letters in the corners of the
+screen, one beside each button, and **reshuffles them for every challenge**. The secret
+is a sequence of *letters* (currently **B, then D**), so the button you press changes
+every attempt. Someone watching your hand cannot copy the code, because the buttons
+pressed are different each time.
+
+### How it works
+1. The Pi sends a challenge (`'C'` + 16 random bytes).
+2. `shuffleLayout()` uses those random bytes to shuffle which letter sits beside which
+   button (Fisher-Yates shuffle).
+3. `drawKeypad()` draws the four letters in the screen corners, with progress dots in the
+   middle. The letters pressed are never shown, only dots.
+4. `pollKeypad()` detects each button press (with debounce) and converts the button back
+   into the letter currently beside it.
+5. After `GESTURE_LEN` presses the watch compares the letters with the secret. A match
+   sends `'R'` + HMAC to the Pi. A mismatch sends `'N'` (denied).
+
+### Button positions
+| Button | Index | Screen corner |
+|---|---|---|
+| Upper left | 0 | top-left |
+| Upper right | 1 | top-right |
+| Lower left | 2 | bottom-left |
+| Lower right | 3 | bottom-right |
+
+
 Commit your own work under your own name so the history shows who did what.
 
 ## References
