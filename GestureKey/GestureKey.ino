@@ -48,7 +48,7 @@ uint8_t ble_can_sleep = false;
 uint8_t ble_connection_state = false;
 
 // ---- tuning ----
-const float         FLICK_THRESHOLD     = 70.0;   // counts above gravity baseline (256 counts = 1 g at +/-2 g); raise to ~90 if it triggers too easily
+const float         FLICK_THRESHOLD     = 90.0;   // counts above gravity baseline (256 counts = 1 g at +/-2 g); raise to ~90 if it triggers too easily
 const unsigned long SAMPLE_MS           = 20;     // 50 Hz sampling
 const unsigned long REFRACTORY_MS       = 300;    // ignore the "return swing" after a flick
 const unsigned long STEP_TIMEOUT_MS     = 4000;   // max pause between flicks of one gesture
@@ -72,7 +72,7 @@ uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT, SYM_RIGHT, SYM_DOWN };
 
 // Debug aid: shows each detected flick direction on the watch. Set to false for the demo,
 // because it leaks the secret gesture.
-const bool DEBUG_SHOW_DIR = true;
+const bool DEBUG_SHOW_DIR = false;
 
 const char* symName(int8_t s) {
   switch (s) {
