@@ -35,7 +35,7 @@
 
 #define BLE_DEBUG true
 #define SerialMonitorInterface SerialUSB
-#define TUNE_MODE false          // true = stream accelerometer high-pass values to Serial Monitor
+#define TUNE_MODE false          // true = stream h / v flick values to Serial Monitor (for calibration)
 
 // If the screen stays blank, try TinyScreenPlus here (the lab examples use Default).
 TinyScreen display = TinyScreen(TinyScreenDefault);
@@ -58,12 +58,17 @@ const unsigned long SCREEN_TIMEOUT_MS   = 15000;
 const unsigned long ENROL_WINDOW_MS     = 60000;  // gesture can only be re-recorded this long after power-up
 const uint8_t       GESTURE_LEN         = 3;
 
-// Flick symbols: direction of the first strong acceleration along the board's axes
-enum { SYM_XP = 0, SYM_XN = 1, SYM_YP = 2, SYM_YN = 3 };
+// ---- orientation (set these during calibration so UP/DOWN/LEFT/RIGHT match how the watch is worn) ----
+const bool SWAP_AXES = false;   // true if the board's X axis is your up/down axis
+const bool INVERT_H  = false;   // true if right/left come out reversed
+const bool INVERT_V  = false;   // true if up/down come out reversed
 
-// Default gesture: X+, X+, Y-.  Re-record with UPPER-LEFT button within 60 s of power-up.
+// Flick symbols: direction the watch is pushed
+enum { SYM_RIGHT = 0, SYM_LEFT = 1, SYM_UP = 2, SYM_DOWN = 3 };
+
+// Default gesture: RIGHT, RIGHT, DOWN.  Re-record with UPPER-LEFT button within 60 s of power-up.
 // (Kept in RAM only: the SAMD21 has no EEPROM, so it resets to this default on power cycle.)
-uint8_t gestureTemplate[GESTURE_LEN] = { SYM_XP, SYM_XP, SYM_YN };
+uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT, SYM_RIGHT, SYM_DOWN };
 
 // ---- state machine ----
 enum State { ST_IDLE, ST_CHALLENGE, ST_ENROL, ST_RESULT };
@@ -130,9 +135,10 @@ void buzz(unsigned int ms) {
 // ---------------------------------------------------------------------------
 // Returns a symbol (0..3) when a flick is detected, otherwise -1.
 // Method: a slow low-pass filter tracks gravity (the "baseline"); subtracting it leaves
-// only the motion. A flick = motion on X or Y above FLICK_THRESHOLD. The axis with the
-// larger value and its sign give the symbol. A refractory period stops the opposite
-// "return swing" being counted as a second flick.
+// only the motion. The board axes are first mapped to horizontal (h) and vertical (v)
+// using the orientation settings above. A flick = motion on h or v above FLICK_THRESHOLD.
+// The axis with the larger value and its sign give RIGHT/LEFT/UP/DOWN. A refractory
+// period stops the opposite "return swing" being counted as a second flick.
 int8_t pollFlick() {
   static unsigned long lastSample = 0, lastFlick = 0;
   static float lpX = 0, lpY = 0;
@@ -148,21 +154,26 @@ int8_t pollFlick() {
   lpX += 0.1 * (x - lpX);
   lpY += 0.1 * (y - lpY);
 
-  float ax = hpX < 0 ? -hpX : hpX;
-  float ay = hpY < 0 ? -hpY : hpY;
+  float h = SWAP_AXES ? hpY : hpX;      // horizontal motion
+  float v = SWAP_AXES ? hpX : hpY;      // vertical motion
+  if (INVERT_H) h = -h;
+  if (INVERT_V) v = -v;
+
+  float ah = h < 0 ? -h : h;
+  float av = v < 0 ? -v : v;
 
 #if TUNE_MODE
-  SerialMonitorInterface.print((int)hpX); SerialMonitorInterface.print(' ');
-  SerialMonitorInterface.println((int)hpY);
+  SerialMonitorInterface.print((int)h); SerialMonitorInterface.print(' ');
+  SerialMonitorInterface.println((int)v);
 #endif
 
   if (millis() - lastFlick < REFRACTORY_MS) return -1;
-  float peak = (ax > ay) ? ax : ay;
+  float peak = (ah > av) ? ah : av;
   if (peak < FLICK_THRESHOLD) return -1;
 
   lastFlick = millis();
-  if (ax >= ay) return (hpX > 0) ? SYM_XP : SYM_XN;
-  return (hpY > 0) ? SYM_YP : SYM_YN;
+  if (ah >= av) return (h > 0) ? SYM_RIGHT : SYM_LEFT;
+  return (v > 0) ? SYM_UP : SYM_DOWN;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,5 +343,3 @@ void loop() {
   }
   checkButtons();
 }
-
-
