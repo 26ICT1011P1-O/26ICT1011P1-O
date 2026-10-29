@@ -38,7 +38,7 @@
 #define TUNE_MODE false          // true = stream h / v flick values to Serial Monitor (for calibration)
 
 // If the screen stays blank, try TinyScreenPlus here (the lab examples use Default).
-TinyScreen display = TinyScreen(TinyScreenDefault);
+TinyScreen display = TinyScreen(TinyScreenPlus);
 BMA250 accel;
 
 // ---- variables UART.ino expects to exist (same names as the SmartWatch example) ----
@@ -48,14 +48,14 @@ uint8_t ble_can_sleep = false;
 uint8_t ble_connection_state = false;
 
 // ---- tuning ----
-const float         FLICK_THRESHOLD     = 130.0;  // counts above gravity baseline (256 counts = 1 g at +/-2 g)
+const float         FLICK_THRESHOLD     = 70.0;   // counts above gravity baseline (256 counts = 1 g at +/-2 g); raise to ~90 if it triggers too easily
 const unsigned long SAMPLE_MS           = 20;     // 50 Hz sampling
-const unsigned long REFRACTORY_MS       = 350;    // ignore the "return swing" after a flick
-const unsigned long STEP_TIMEOUT_MS     = 2500;   // max pause between flicks of one gesture
-const unsigned long CHALLENGE_TIMEOUT_MS = 8000;  // Pi gives up after ~10 s
+const unsigned long REFRACTORY_MS       = 300;    // ignore the "return swing" after a flick
+const unsigned long STEP_TIMEOUT_MS     = 4000;   // max pause between flicks of one gesture
+const unsigned long CHALLENGE_TIMEOUT_MS = 12000; // Pi gives up after ~15 s (RESPONSE_TIMEOUT_S in gk_lock.py)
 const unsigned long RESULT_SHOW_MS      = 2000;
 const unsigned long SCREEN_TIMEOUT_MS   = 15000;
-const unsigned long ENROL_WINDOW_MS     = 60000;  // gesture can only be re-recorded this long after power-up
+const unsigned long ENROL_WINDOW_MS     = 300000; // gesture can only be re-recorded this long after power-up (5 min)
 const uint8_t       GESTURE_LEN         = 3;
 
 // ---- orientation (set these during calibration so UP/DOWN/LEFT/RIGHT match how the watch is worn) ----
@@ -66,9 +66,31 @@ const bool INVERT_V  = false;   // true if up/down come out reversed
 // Flick symbols: direction the watch is pushed
 enum { SYM_RIGHT = 0, SYM_LEFT = 1, SYM_UP = 2, SYM_DOWN = 3 };
 
-// Default gesture: RIGHT, RIGHT, DOWN.  Re-record with UPPER-LEFT button within 60 s of power-up.
+// Default gesture: RIGHT, RIGHT, DOWN.  Re-record with UPPER-LEFT button within 5 min of power-up.
 // (Kept in RAM only: the SAMD21 has no EEPROM, so it resets to this default on power cycle.)
 uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT, SYM_RIGHT, SYM_DOWN };
+
+// Debug aid: shows each detected flick direction on the watch. Set to false for the demo,
+// because it leaks the secret gesture.
+const bool DEBUG_SHOW_DIR = true;
+
+const char* symName(int8_t s) {
+  switch (s) {
+    case SYM_RIGHT: return "RIGHT";
+    case SYM_LEFT:  return "LEFT";
+    case SYM_UP:    return "UP";
+    default:        return "DOWN";
+  }
+}
+
+char symChar(int8_t s) {
+  switch (s) {
+    case SYM_RIGHT: return 'R';
+    case SYM_LEFT:  return 'L';
+    case SYM_UP:    return 'U';
+    default:        return 'D';
+  }
+}
 
 // ---- state machine ----
 enum State { ST_IDLE, ST_CHALLENGE, ST_ENROL, ST_RESULT };
@@ -105,7 +127,7 @@ void wakeScreen() {
   if (!displayOn) { display.on(); displayOn = 1; }
 }
 
-// Progress is shown as dots only. Showing the flick directions would leak the secret.
+// Progress is shown as dots. With DEBUG_SHOW_DIR the last flick direction is also shown.
 void showProgress(const char* title) {
   char dots[2 * GESTURE_LEN + 1];
   for (uint8_t i = 0; i < GESTURE_LEN; i++) {
@@ -113,7 +135,9 @@ void showProgress(const char* title) {
     dots[2 * i + 1] = ' ';
   }
   dots[2 * GESTURE_LEN] = '\0';
-  showScreen(title, dots, "", TS_8b_Yellow);
+  showScreen(title, dots,
+             (DEBUG_SHOW_DIR && enteredCount > 0) ? symName(entered[enteredCount - 1]) : "",
+             TS_8b_Yellow);
 }
 
 void showIdle() {
@@ -251,7 +275,10 @@ void finishResult(bool ok) {
     buzz(80);
   } else {
     sendDenied();
-    showScreen("DENIED", "Wrong gesture", "", TS_8b_Red);
+    char got[GESTURE_LEN + 1];
+    for (uint8_t i = 0; i < GESTURE_LEN; i++) got[i] = symChar(entered[i]);
+    got[GESTURE_LEN] = '\0';
+    showScreen("DENIED", "Wrong gesture", DEBUG_SHOW_DIR ? got : "", TS_8b_Red);
     buzz(400);
   }
 }
@@ -334,7 +361,7 @@ void loop() {
       if (millis() - stateStart > RESULT_SHOW_MS) { state = ST_IDLE; showIdle(); }
       break;
     case ST_ENROL:
-      if (millis() - stateStart > 20000) { state = ST_IDLE; showIdle(); }   // give up quietly
+      if (millis() - stateStart > 30000) { state = ST_IDLE; showIdle(); }   // give up quietly
       break;
     case ST_IDLE:
       if (lastBleShown != ble_connection_state) { wakeScreen(); showIdle(); }   // wake + redraw when the link changes
