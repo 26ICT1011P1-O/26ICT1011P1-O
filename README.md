@@ -25,8 +25,10 @@ GestureKey/            Arduino sketch for the TinyScreen+ (open GestureKey.ino)
   secrets.h            shared key  -- NOT in git, see below
 pi/
   gk_lock.py           BLE client, verifier, lockout, servo, logging
+  gk_notify.py         Telegram alerts (standard library only)
   dashboard.py         Flask page showing the access log
   gk_key.txt           shared key (hex) -- NOT in git
+  tests/               unit tests (verify/lockout logic, Telegram, firmware crypto)
 ```
 
 ## Hardware
@@ -60,6 +62,33 @@ Generate a key and share it with teammates privately (not via GitHub):
 python3 -c "import os;print(os.urandom(16).hex())"
 ```
 `gk_key.txt` holds the hex string; `secrets.h` holds the same bytes as a C array.
+
+## Telegram alerts
+The Pi sends a Telegram message on every unlock and when a lockout starts.
+1. Create a bot with **@BotFather** and copy the token.
+2. Send your bot any message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates`
+   and read your chat id.
+3. Set environment variables (never commit the token):
+```
+# PowerShell
+$env:TELEGRAM_BOT_TOKEN="123456:ABC..."
+$env:TELEGRAM_CHAT_ID="123456789"
+# Linux / Pi
+export TELEGRAM_BOT_TOKEN=...  TELEGRAM_CHAT_ID=...
+```
+4. Check it works: `python3 gk_lock.py --test-telegram`
+
+If the variables are not set, alerts are skipped and the lock works as normal.
+
+## Tests
+```
+cd pi
+python -m unittest discover -s tests -v
+```
+- `test_gk_lock.py`: verify, replay rejection, forged/wrong-key responses, timeouts, lockout and
+  expiry, Telegram alerts (fake watch, mocked network, no hardware needed).
+- `test_firmware_crypto.py`: compiles the watch's `gk_crypto.h` with gcc/clang and checks it matches
+  Python's HMAC, including the RFC 4231 test vector. Skipped if no C compiler is installed.
 
 ## Tuning the gesture
 Set `TUNE_MODE true` in `GestureKey.ino`, open the Serial Monitor, and watch the values
