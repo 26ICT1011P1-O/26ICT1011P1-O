@@ -14,22 +14,25 @@ Everything else is our own work.
 
 Run:  pip install bleak gpiozero pigpio
       python3 gk_lock.py --scan     (debug: list nearby BLE devices)
+      python3 gk_lock.py --test-telegram   (check Telegram alert setup)
       python3 gk_lock.py            (press Enter to request an unlock)
 """
 import asyncio, hmac, hashlib, json, os, sys, time, warnings
+import gk_notify                    # Telegram alerts (see gk_notify.py)
 warnings.filterwarnings("ignore")   # silence gpiozero pin-factory warnings when not on a Pi
 
 NAME_PREFIX = "GKey"                                   # advertised name set in UART.ino
 NUS_WRITE  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"    # watch receives challenges here
 NUS_NOTIFY = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"    # watch sends responses here
-KEY = bytes.fromhex(open(os.path.join(os.path.dirname(__file__), "gk_key.txt")).read().strip())
+KEY_FILE = os.environ.get("GK_KEY_FILE", os.path.join(os.path.dirname(__file__), "gk_key.txt"))
+KEY = bytes.fromhex(open(KEY_FILE).read().strip())
 
 RESPONSE_TIMEOUT_S = 10      # watch allows ~8 s for the gesture
 MAX_FAILS = 3
 LOCKOUT_S = 30
 UNLOCK_HOLD_S = 5
 SERVO_PIN = 18
-LOG_FILE = os.path.join(os.path.dirname(__file__), "access_log.jsonl")
+LOG_FILE = os.environ.get("GK_LOG_FILE", os.path.join(os.path.dirname(__file__), "access_log.jsonl"))
 WATCH_ADDR = os.environ.get("GK_ADDR")      # optional: skip name matching, connect by address
 
 # ---- servo (falls back to printing when not on a Pi, so you can test on a laptop) ----
@@ -51,6 +54,17 @@ def log(event: str, detail: str = ""):
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(rec) + "\n")
     print("[log]", rec)
+
+# ---- Telegram alerts: fire-and-forget so a slow network never delays the lock ----
+_bg_tasks = set()
+
+async def _send_alert(text: str):
+    await asyncio.get_running_loop().run_in_executor(None, gk_notify.send_telegram, text)
+
+def fire_alert(text: str):
+    t = asyncio.get_running_loop().create_task(_send_alert(text))
+    _bg_tasks.add(t)                       # keep a reference so the task is not garbage-collected
+    t.add_done_callback(_bg_tasks.discard)
 
 fails = 0
 locked_until = 0.0
@@ -92,6 +106,7 @@ async def attempt(client):
     if ok:
         fails = 0
         log("unlock", "gesture + HMAC verified")
+        fire_alert("GestureKey: door UNLOCKED at " + time.strftime("%H:%M:%S"))
         set_lock(True)
         await asyncio.sleep(UNLOCK_HOLD_S)
         set_lock(False)
@@ -102,6 +117,8 @@ async def attempt(client):
             locked_until = time.time() + LOCKOUT_S
             fails = 0
             log("lockout", f"{LOCKOUT_S} s")
+            fire_alert(f"GestureKey ALERT: {MAX_FAILS} failed unlock attempts. "
+                       f"Locked out for {LOCKOUT_S} s (" + time.strftime("%H:%M:%S") + ")")
             await client.write_gatt_char(NUS_WRITE, b"L", response=False)
 
 def is_watch(d, ad):
@@ -144,6 +161,10 @@ async def main():
         await asyncio.sleep(3)      # then rescan / reconnect
 
 if __name__ == "__main__":
+    if "--test-telegram" in sys.argv:
+        ok = gk_notify.send_telegram("GestureKey: test message")
+        print("[telegram]", "sent" if ok else "NOT sent (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / network)")
+        sys.exit(0 if ok else 1)
     try:
         asyncio.run(list_devices() if "--scan" in sys.argv else main())
     except KeyboardInterrupt:
