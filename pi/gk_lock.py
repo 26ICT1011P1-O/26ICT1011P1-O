@@ -7,6 +7,7 @@ Protocol (matches GestureKey.ino):
   watch -> Pi : b'R' + 16 bytes          (= HMAC-SHA256(key, b'A' + nonce)[:16])  approved
                 b'N'                      denied (wrong gesture)
   Pi -> watch : b'L'                      locked out notice
+  Pi -> watch : b'S' + b'U' / b'K'        door status: unlocked / locked (shown on the watch's idle screen)
 
 Attribution: BLE UART UUIDs are the Nordic UART Service used by the TinyCircuits
 SmartWatch example. BLE client uses the 'bleak' library; servo uses 'gpiozero'.
@@ -27,9 +28,11 @@ NUS_NOTIFY = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"    # watch sends responses h
 KEY_FILE = os.environ.get("GK_KEY_FILE", os.path.join(os.path.dirname(__file__), "gk_key.txt"))
 KEY = bytes.fromhex(open(KEY_FILE).read().strip())
 
-RESPONSE_TIMEOUT_S = 10      # watch allows ~8 s for the gesture
+RESPONSE_TIMEOUT_S = 15      # must be LONGER than the watch's CHALLENGE_TIMEOUT_MS (12 s) or the Pi gives up first
 MAX_FAILS = 3
 LOCKOUT_S = 30
+SEND_DOOR_STATUS = True    # tell the watch whether the door is locked or unlocked
+TEST_NO_LOCKOUT = True     # testing: wrong gestures never lock you out. Set False for the real demo
 UNLOCK_HOLD_S = 5
 SERVO_PIN = 18
 LOG_FILE = os.environ.get("GK_LOG_FILE", os.path.join(os.path.dirname(__file__), "access_log.jsonl"))
@@ -70,6 +73,15 @@ fails = 0
 locked_until = 0.0
 pending = None          # Future for the challenge currently in flight (one at a time)
 
+async def send_status(client, code: bytes):
+    """Tell the watch the door state: b'U' = unlocked, b'K' = locked. Never raises."""
+    if not SEND_DOOR_STATUS:
+        return
+    try:
+        await client.write_gatt_char(NUS_WRITE, b"S" + code, response=False)
+    except Exception as e:
+        print(f"[status] not sent ({e.__class__.__name__})")
+
 def on_notify(_sender, data: bytearray):
     if pending is not None and not pending.done():
         pending.set_result(bytes(data))
@@ -108,12 +120,16 @@ async def attempt(client):
         log("unlock", "gesture + HMAC verified")
         fire_alert("GestureKey: door UNLOCKED at " + time.strftime("%H:%M:%S"))
         set_lock(True)
+        await send_status(client, b"U")
         await asyncio.sleep(UNLOCK_HOLD_S)
         set_lock(False)
+        await send_status(client, b"K")
     else:
         fails += 1
         log("fail", f"{why} ({fails}/{MAX_FAILS})")
-        if fails >= MAX_FAILS:
+        if fails >= MAX_FAILS and TEST_NO_LOCKOUT:
+            fails = 0                         # testing: no lockout, keep the counter from running past the limit
+        elif fails >= MAX_FAILS:
             locked_until = time.time() + LOCKOUT_S
             fails = 0
             log("lockout", f"{LOCKOUT_S} s")
@@ -146,6 +162,7 @@ async def session():
     async with BleakClient(dev) as client:
         await client.start_notify(NUS_NOTIFY, on_notify)
         log("connected", dev.address)
+        await send_status(client, b"K")          # door is locked when we connect
         loop = asyncio.get_running_loop()
         while client.is_connected:
             await loop.run_in_executor(None, input, "Press Enter to request unlock > ")
@@ -169,3 +186,5 @@ if __name__ == "__main__":
         asyncio.run(list_devices() if "--scan" in sys.argv else main())
     except KeyboardInterrupt:
         print("\nstopped")
+
+        
