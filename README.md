@@ -31,7 +31,6 @@ pi/
   .env.example         template for pi/.env (token, chat id, options)
   dashboard.py         Flask page showing the access log
   gk_key.txt           shared key (hex) -- NOT in git
-  tests/               unit tests (verify/lockout logic, Telegram, firmware crypto)
 ```
 
 ## Hardware
