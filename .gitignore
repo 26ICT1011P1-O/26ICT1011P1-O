@@ -1,3 +1,5 @@
 GestureKey/secrets.h
-pi/gk.txt
+pi/gk_key.txt
 pi/access_log.jsonl
+pi/access_log.jsonl.lockdown
+pi/.env
