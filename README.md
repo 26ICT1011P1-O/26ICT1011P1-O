@@ -14,6 +14,8 @@ logs every attempt and enforces a lockout after repeated failures.
    `HMAC-SHA256(key, 'A' + nonce)`. Otherwise it replies `'N'`.
 4. Pi verifies the HMAC, unlocks the servo, and logs the result.
 5. After 3 failures the Pi locks out for 30 s and sends `'L'` to the watch.
+6. The Pi also keeps the watch informed: `'T'` + hour, minute, second sets its clock (the watch has no
+   battery-backed clock), and `'S'` + `U`/`K` tells it whether the door is unlocked or locked.
 
 ## Repository layout
 ```
@@ -25,7 +27,8 @@ GestureKey/            Arduino sketch for the TinyScreen+ (open GestureKey.ino)
   secrets.h            shared key  -- NOT in git, see below
 pi/
   gk_lock.py           BLE client, verifier, lockout, servo, logging
-  gk_notify.py         Telegram alerts (standard library only)
+  gk_notify.py         Telegram alerts, commands, approval buttons (standard library only)
+  .env.example         template for pi/.env (token, chat id, options)
   dashboard.py         Flask page showing the access log
   gk_key.txt           shared key (hex) -- NOT in git
   tests/               unit tests (verify/lockout logic, Telegram, firmware crypto)
@@ -64,34 +67,57 @@ python3 -c "import os;print(os.urandom(16).hex())"
 `gk_key.txt` holds the hex string; `secrets.h` holds the same bytes as a C array.
 
 ## Telegram bot
-The Pi sends Telegram alerts and also accepts a few commands.
+The Pi sends Telegram alerts, accepts a few commands, and can require your approval as a second factor.
+
+**Settings go in `pi/.env`** (copy `pi/.env.example`; it is git-ignored). Real environment variables
+override it. Never commit the token.
 
 **Alerts** (each message names the lock, e.g. "Front door"; set `GK_LOCK_NAME` to change it)
 - Unlock: time and confirmation that gesture + HMAC were verified
 - Each failed attempt: counter (1/3, 2/3) and the reason (wrong gesture, bad HMAC, ...)
 - Lockout: duration and the list of reasons for all 3 failures
 - Timeout (watch did not respond) and watch disconnect, rate-limited so they cannot spam you
+- Optional daily summary: set `GK_DAILY_SUMMARY_AT=21:00`
+
+**Reliable delivery:** alerts go through a background queue. Network errors and server errors are retried
+with growing delays (2, 4, 8, 16 s), Telegram's "slow down" (429) is honoured, messages go out in order
+at most about 1 per second, and permanent errors (bad token or chat id) are dropped with a log line.
+A slow or offline network never delays the lock.
 
 **Commands** (send these to your bot)
 | Command | What it does |
 |---|---|
 | `/status` | watch connected?, lockdown, lockout time left, failed attempts, last event |
 | `/log [n]` | last n events (default 5, max 10) |
+| `/summary` | today's counts: unlocks, failures, lockouts, timeouts, ... |
 | `/lockdown` | block all unlock requests, even valid ones, until `/resume`. Survives a restart |
 | `/resume` | allow unlocking again |
 | `/help` | list commands |
 
-**Security:** a bot username is public, so anyone can message it. Commands are obeyed **only** from the
-chat id in `TELEGRAM_CHAT_ID`; every other chat is ignored with no reply. Messages sent while the
-script was offline are skipped at startup so an old `/lockdown` cannot fire later.
-Only one machine can read a bot's messages at a time, so teammates should use their own bots
-(or set `GK_TELEGRAM_COMMANDS=0` to turn commands off and keep alerts only).
+**Second factor (optional): `GK_REQUIRE_APPROVAL=1`**
+After a correct gesture and a valid HMAC, the bot sends "Unlock requested. Approve?" with **Approve** and
+**Deny** buttons. The door only opens if you tap Approve within `GK_APPROVAL_TIMEOUT` seconds (default 20).
+- A wrong gesture or bad HMAC never reaches this step.
+- Deny or no answer keeps the door locked. That is **not** counted as a failed guess (the gesture was right).
+- Each request has its own random id, so an old button can never approve a newer request.
+- If Telegram is unreachable the door **stays locked** (fail closed). `GK_APPROVAL_FAIL_OPEN=1` allows
+  gesture-only unlocks in that case, which is more convenient but weaker: someone who can block your
+  network can then bypass the second factor. Leave it off unless you accept that.
+- The script refuses to start if approval is on but Telegram is not configured, the listener is off, or
+  the chat id is a group (negative number). It never silently runs with weaker security than you asked for.
+- Note: the watch already shows "APPROVED" after the gesture, before you tap Approve on your phone.
+
+**Security of commands and buttons:** a bot username is public, so anyone can message it. Commands are
+obeyed **only** from the chat id in `TELEGRAM_CHAT_ID`; every other chat is ignored with no reply. Button
+presses additionally require that the person pressing is the owner. Messages sent while the script was
+offline are skipped at startup so an old `/lockdown` cannot fire later. Only one machine can read a bot's
+messages at a time, so teammates should use their own bots, or set `GK_TELEGRAM_COMMANDS=0` for alerts only.
 
 **Setup**
 1. Create a bot with **@BotFather** and copy the token.
 2. Send your bot any message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates`
    and read your chat id (`"chat":{"id":...}`). It is not the number at the front of the token.
-3. Set environment variables (never commit the token):
+3. Put both in `pi/.env`, or set them in the terminal:
 ```
 # PowerShell
 $env:TELEGRAM_BOT_TOKEN="123456:ABC..."
@@ -108,12 +134,25 @@ If the variables are not set, alerts and commands are skipped and the lock works
 cd pi
 python -m unittest discover -s tests -v
 ```
+- `test_merged_features.py`: watch clock and door-status messages, allowed hours (including windows
+  that wrap past midnight), and the test-mode switch.
 - `test_gk_lock.py`: verify, replay rejection, forged/wrong-key responses, timeouts, lockout and
   expiry (fake watch, mocked network, no hardware needed).
 - `test_telegram_bot.py`: alert contents and rate limiting, every command, lockdown (including
   surviving a restart), and the chat-id allow-list: strangers are ignored, the owner is obeyed.
+- `test_approval_and_hygiene.py`: the approval second factor (approve, deny, timeout, Telegram down,
+  stale and double button presses, impostors), alert retries and backoff, the `.env` loader, the daily
+  summary and the startup safety checks.
 - `test_firmware_crypto.py`: compiles the watch's `gk_crypto.h` with gcc/clang and checks it matches
   Python's HMAC, including the RFC 4231 test vector. Skipped if no C compiler is installed.
+
+## Door rules
+- **Allowed hours:** `GK_ALLOWED_HOURS=7-23` in `pi/.env` refuses unlock attempts outside 07:00-22:59
+  (`22-6` wraps past midnight). Refusals are logged and sent to Telegram.
+- **Test mode:** `GK_TEST_NO_LOCKOUT=1` stops failed attempts from locking you out while you test gestures.
+  It is **off by default** and the script prints a warning when it is on. Turn it off for the demo, or the
+  lockout and its Telegram alert will not happen.
+- **Clock and door status on the watch** are sent automatically on connect and after every unlock.
 
 ## Tuning the gesture
 Set `TUNE_MODE true` in `GestureKey.ino`, open the Serial Monitor, and watch the values
@@ -127,6 +166,9 @@ Default gesture: X+, X+, Y-. Re-record with the upper-left button within 60 s of
   does not defend against a stolen watch whose owner is coerced, or a compromised Pi.
 
 ## Team and contributions
+Credit each person for what they built. Example: the watch clock, the door-status display and the
+allowed-hours rule were added by a teammate (add their name below).
+
 | Member | Area |
 |---|---|
 | | Watch UI and firmware |
