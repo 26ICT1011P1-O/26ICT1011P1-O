@@ -9,6 +9,7 @@
 //       No match -> watch notifies  'N'  (denied)
 //    5. Pi verifies the HMAC, drives the servo lock, logs the attempt.
 //    Pi may also send 'L' (locked out) which the watch just displays.
+//    Pi sends 'T'+hour+min+sec to set the watch clock (the watch has no battery-backed RTC).
 //    Pi also sends 'S'+'U' (door unlocked) / 'S'+'K' (door locked) so the idle screen shows the door state.
 //
 //  ATTRIBUTION (the brief requires this - keep it in the video too):
@@ -50,7 +51,7 @@ uint8_t ble_connection_state = false;
 
 // ---- tuning ----
 // Counts are above the gravity baseline (256 counts = 1 g at +/-2 g).
-const float         FLICK_THRESHOLD     = 80.0;  // peak needed to START a flick. Raise if small movements count, lower if real flicks are missed
+const float         FLICK_THRESHOLD     = 110.0;  // peak needed to START a flick. Raise if small movements count, lower if real flicks are missed
 const float         SUSTAIN_THRESHOLD   = 60.0;   // a real flick stays above this for a few samples; a cable tug or knock is a brief spike
 const uint8_t       MIN_SUSTAIN_SAMPLES = 3;      // samples (10 ms each) that must reach SUSTAIN_THRESHOLD. 1 = most forgiving, 4 = strict
 const float         DOMINANCE_RATIO     = 1.3;    // winning axis must beat the other axis by this factor, else the flick is ignored as diagonal
@@ -75,7 +76,7 @@ enum { SYM_RIGHT = 0, SYM_LEFT = 1, SYM_UP = 2, SYM_DOWN = 3 };
 
 // Default gesture: one RIGHT flick.  Re-record with UPPER-LEFT button within 5 min of power-up.
 // (Kept in RAM only: the SAMD21 has no EEPROM, so it resets to this default on power cycle.)
-uint8_t gestureTemplate[GESTURE_LEN] = {SYM_RIGHT};
+uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT };
 
 // Debug aid: shows each detected flick direction on the watch. Set to false for the demo,
 // because it leaks the secret gesture.
@@ -114,6 +115,20 @@ uint8_t  buttonReleased = 1;
 uint8_t  lastBleShown = 255;
 enum DoorState { DOOR_UNKNOWN, DOOR_LOCKED, DOOR_UNLOCKED };
 DoorState doorState = DOOR_UNKNOWN;   // last door state reported by the Pi
+
+// ---- clock: the Pi sets the time, the watch counts forward from its own timer ----
+bool          timeKnown = false;
+uint32_t      timeBaseSec = 0;          // seconds since midnight at the last sync
+unsigned long timeBaseMs = 0;           // millis() at the last sync
+int32_t       lastUnlockSec = -1;       // time of the last unlock confirmed by the Pi (-1 = none yet)
+uint32_t      lastClockMinute = 0xFFFFFFFF;   // minute currently drawn, so the screen refreshes once a minute
+
+uint32_t nowSec() { return (timeBaseSec + (millis() - timeBaseMs) / 1000UL) % 86400UL; }
+
+void fmtTime(char* out, uint32_t sec) {   // out must hold at least 6 chars: "HH:MM"
+  snprintf(out, 6, "%02lu:%02lu", (unsigned long)((sec / 3600UL) % 24UL), (unsigned long)((sec / 60UL) % 60UL));
+}
+uint8_t  lastCountdownShown = 255;   // seconds-left value currently drawn (255 = redraw needed)
 bool     flickReset = true;       // set after anything slow (screen redraw, buzz) or at the start of a gesture, so the gravity baseline re-primes
 
 const FONT_INFO& font10pt = thinPixel7_10ptFontInfo;
@@ -124,6 +139,7 @@ const uint8_t vibratePin = 6;      // same pin as the SmartWatch example (option
 // ---------------------------------------------------------------------------
 void showScreen(const char* l1, const char* l2, const char* l3, uint8_t color) {
   flickReset = true;   // a redraw blocks the loop, so the baseline must re-prime afterwards
+  lastCountdownShown = 255;   // a full redraw wipes the countdown line, so draw it again
   display.clearScreen();
   display.setFont(font10pt);
   display.fontColor(color, TS_8b_Black);
@@ -151,19 +167,39 @@ void showProgress(const char* title) {
              TS_8b_Yellow);
 }
 
+// Shows "Time left 12s" on the third line during a challenge. It redraws only that line
+// (no clearScreen, no baseline reset), once per second, so it never disturbs flick detection.
+void drawCountdown() {
+  unsigned long elapsed = millis() - stateStart;
+  uint8_t left = (elapsed >= CHALLENGE_TIMEOUT_MS) ? 0 : (uint8_t)((CHALLENGE_TIMEOUT_MS - elapsed + 999UL) / 1000UL);
+  if (left == lastCountdownShown) return;
+  lastCountdownShown = left;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "Time left %2ds ", (int)left);   // trailing space wipes leftover characters
+  display.setFont(font10pt);
+  display.fontColor(left <= 3 ? TS_8b_Red : TS_8b_Gray, TS_8b_Black);   // turns red for the last 3 seconds
+  display.setCursor(2, 42);
+  display.print(buf);
+}
+
 void showIdle() {
   lastBleShown = ble_connection_state;
+  char l1[16], l3[16], t[6];
+  if (timeKnown) { fmtTime(t, nowSec()); snprintf(l1, sizeof(l1), "GKey  %s", t); }
+  else           { snprintf(l1, sizeof(l1), "GKey  --:--"); }
+  lastClockMinute = timeKnown ? nowSec() / 60UL : 0xFFFFFFFF;
+
   bool showDoor = ble_connection_state && doorState != DOOR_UNKNOWN;
-  const char* l3 = showDoor ? (doorState == DOOR_UNLOCKED ? "Door: UNLOCKED" : "Door: LOCKED")
-                            : ((millis() < ENROL_WINDOW_MS) ? "UL btn = enrol" : "Ready");
-  showScreen("GestureKey",
-             ble_connection_state ? "Pi: connected" : "Pi: waiting...",
-             l3,
-             ble_connection_state ? TS_8b_Green : TS_8b_Gray);
+  const char* l2 = showDoor ? (doorState == DOOR_UNLOCKED ? "Door: UNLOCKED" : "Door: LOCKED")
+                            : (ble_connection_state ? "Pi: connected" : "Pi: waiting...");
+  if (lastUnlockSec >= 0) { fmtTime(t, (uint32_t)lastUnlockSec); snprintf(l3, sizeof(l3), "Last: %s", t); }
+  else snprintf(l3, sizeof(l3), "%s", (millis() < ENROL_WINDOW_MS) ? "UL btn = enrol" : "Ready");
+
+  showScreen(l1, l2, l3, ble_connection_state ? TS_8b_Green : TS_8b_Gray);
   if (showDoor) {                       // redraw the door line in colour: green = unlocked, red = locked
     display.fontColor(doorState == DOOR_UNLOCKED ? TS_8b_Green : TS_8b_Red, TS_8b_Black);
-    display.setCursor(2, 42);
-    display.print(l3);
+    display.setCursor(2, 26);
+    display.print(l2);
   }
 }
 
@@ -290,10 +326,19 @@ void handleBleMessage() {
     // Door status from the Pi: 'U' = unlocked, 'K' = locked
     DoorState prev = doorState;
     doorState = (ble_rx_buffer[1] == 'U') ? DOOR_UNLOCKED : DOOR_LOCKED;
+    if (doorState == DOOR_UNLOCKED && prev != DOOR_UNLOCKED && timeKnown) lastUnlockSec = (int32_t)nowSec();
     if (state == ST_IDLE) {              // never interrupt a gesture or a result screen; the idle redraw shows it later
       wakeScreen();
       showIdle();
       if (doorState == DOOR_UNLOCKED && prev != DOOR_UNLOCKED) { buzz(60); delay(80); buzz(60); }   // double pulse
+    }
+  } else if (type == 'T' && len == 4) {
+    // Clock sync from the Pi: hour, minute, second
+    if (ble_rx_buffer[1] < 24 && ble_rx_buffer[2] < 60 && ble_rx_buffer[3] < 60) {
+      timeBaseSec = ble_rx_buffer[1] * 3600UL + ble_rx_buffer[2] * 60UL + ble_rx_buffer[3];
+      timeBaseMs = millis();
+      timeKnown = true;
+      if (state == ST_IDLE && displayOn) showIdle();     // update the clock without waking the screen
     }
   } else if (type == 'L') {
     state = ST_RESULT;
@@ -409,6 +454,7 @@ void loop() {
 
   switch (state) {
     case ST_CHALLENGE:
+      drawCountdown();
       if (millis() - stateStart > CHALLENGE_TIMEOUT_MS) {
         state = ST_RESULT;
         stateStart = millis();
@@ -426,6 +472,7 @@ void loop() {
         if (!ble_connection_state) doorState = DOOR_UNKNOWN;   // link lost: we no longer know the door state
         wakeScreen(); showIdle();
       }   // wake + redraw when the link changes
+      if (displayOn && timeKnown && nowSec() / 60UL != lastClockMinute) showIdle();   // clock tick, once a minute
       if (displayOn && millis() - screenTimer > SCREEN_TIMEOUT_MS) { display.off(); displayOn = 0; }
       break;
   }
