@@ -9,6 +9,7 @@
 //       No match -> watch notifies  'N'  (denied)
 //    5. Pi verifies the HMAC, drives the servo lock, logs the attempt.
 //    Pi may also send 'L' (locked out) which the watch just displays.
+//    Pi also sends 'S'+'U' (door unlocked) / 'S'+'K' (door locked) so the idle screen shows the door state.
 //
 //  ATTRIBUTION (the brief requires this - keep it in the video too):
 //    - BLE UART service (UART.ino, STBLE library): TinyCircuits ST BLE smartwatch
@@ -48,15 +49,21 @@ uint8_t ble_can_sleep = false;
 uint8_t ble_connection_state = false;
 
 // ---- tuning ----
-const float         FLICK_THRESHOLD     = 90.0;   // counts above gravity baseline (256 counts = 1 g at +/-2 g); raise to ~90 if it triggers too easily
-const unsigned long SAMPLE_MS           = 20;     // 50 Hz sampling
-const unsigned long REFRACTORY_MS       = 300;    // ignore the "return swing" after a flick
+// Counts are above the gravity baseline (256 counts = 1 g at +/-2 g).
+const float         FLICK_THRESHOLD     = 80.0;  // peak needed to START a flick. Raise if small movements count, lower if real flicks are missed
+const float         SUSTAIN_THRESHOLD   = 60.0;   // a real flick stays above this for a few samples; a cable tug or knock is a brief spike
+const uint8_t       MIN_SUSTAIN_SAMPLES = 3;      // samples (10 ms each) that must reach SUSTAIN_THRESHOLD. 1 = most forgiving, 4 = strict
+const float         DOMINANCE_RATIO     = 1.3;    // winning axis must beat the other axis by this factor, else the flick is ignored as diagonal
+const float         LP_ALPHA            = 0.05;   // gravity baseline speed (smaller = slower)
+const unsigned long SAMPLE_MS           = 10;     // 100 Hz sampling
+const unsigned long CAPTURE_MS          = 60;     // after a flick starts, track the peak this long before choosing a direction
+const unsigned long REFRACTORY_MS       = 450;    // ignore the "return swing" after a flick
 const unsigned long STEP_TIMEOUT_MS     = 4000;   // max pause between flicks of one gesture
-const unsigned long CHALLENGE_TIMEOUT_MS = 12000; // Pi gives up after ~15 s (RESPONSE_TIMEOUT_S in gk_lock.py)
+const unsigned long CHALLENGE_TIMEOUT_MS = 12000; // must stay BELOW RESPONSE_TIMEOUT_S in gk_lock.py (15 s), or the Pi gives up first
 const unsigned long RESULT_SHOW_MS      = 2000;
 const unsigned long SCREEN_TIMEOUT_MS   = 15000;
 const unsigned long ENROL_WINDOW_MS     = 300000; // gesture can only be re-recorded this long after power-up (5 min)
-const uint8_t       GESTURE_LEN         = 3;
+const uint8_t       GESTURE_LEN         = 1;
 
 // ---- orientation (set these during calibration so UP/DOWN/LEFT/RIGHT match how the watch is worn) ----
 const bool SWAP_AXES = false;   // true if the board's X axis is your up/down axis
@@ -66,9 +73,9 @@ const bool INVERT_V  = false;   // true if up/down come out reversed
 // Flick symbols: direction the watch is pushed
 enum { SYM_RIGHT = 0, SYM_LEFT = 1, SYM_UP = 2, SYM_DOWN = 3 };
 
-// Default gesture: RIGHT, RIGHT, DOWN.  Re-record with UPPER-LEFT button within 5 min of power-up.
+// Default gesture: one RIGHT flick.  Re-record with UPPER-LEFT button within 5 min of power-up.
 // (Kept in RAM only: the SAMD21 has no EEPROM, so it resets to this default on power cycle.)
-uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT, SYM_RIGHT, SYM_DOWN };
+uint8_t gestureTemplate[GESTURE_LEN] = {SYM_RIGHT};
 
 // Debug aid: shows each detected flick direction on the watch. Set to false for the demo,
 // because it leaks the secret gesture.
@@ -105,6 +112,9 @@ unsigned long screenTimer = 0;
 uint8_t  displayOn = 0;
 uint8_t  buttonReleased = 1;
 uint8_t  lastBleShown = 255;
+enum DoorState { DOOR_UNKNOWN, DOOR_LOCKED, DOOR_UNLOCKED };
+DoorState doorState = DOOR_UNKNOWN;   // last door state reported by the Pi
+bool     flickReset = true;       // set after anything slow (screen redraw, buzz) or at the start of a gesture, so the gravity baseline re-primes
 
 const FONT_INFO& font10pt = thinPixel7_10ptFontInfo;
 const uint8_t vibratePin = 6;      // same pin as the SmartWatch example (optional vibration board)
@@ -113,6 +123,7 @@ const uint8_t vibratePin = 6;      // same pin as the SmartWatch example (option
 // Display helpers
 // ---------------------------------------------------------------------------
 void showScreen(const char* l1, const char* l2, const char* l3, uint8_t color) {
+  flickReset = true;   // a redraw blocks the loop, so the baseline must re-prime afterwards
   display.clearScreen();
   display.setFont(font10pt);
   display.fontColor(color, TS_8b_Black);
@@ -142,16 +153,25 @@ void showProgress(const char* title) {
 
 void showIdle() {
   lastBleShown = ble_connection_state;
+  bool showDoor = ble_connection_state && doorState != DOOR_UNKNOWN;
+  const char* l3 = showDoor ? (doorState == DOOR_UNLOCKED ? "Door: UNLOCKED" : "Door: LOCKED")
+                            : ((millis() < ENROL_WINDOW_MS) ? "UL btn = enrol" : "Ready");
   showScreen("GestureKey",
              ble_connection_state ? "Pi: connected" : "Pi: waiting...",
-             (millis() < ENROL_WINDOW_MS) ? "UL btn = enrol" : "Ready",
+             l3,
              ble_connection_state ? TS_8b_Green : TS_8b_Gray);
+  if (showDoor) {                       // redraw the door line in colour: green = unlocked, red = locked
+    display.fontColor(doorState == DOOR_UNLOCKED ? TS_8b_Green : TS_8b_Red, TS_8b_Black);
+    display.setCursor(2, 42);
+    display.print(l3);
+  }
 }
 
 void buzz(unsigned int ms) {
   digitalWrite(vibratePin, HIGH);
   delay(ms);
   digitalWrite(vibratePin, LOW);
+  flickReset = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,23 +180,27 @@ void buzz(unsigned int ms) {
 // Returns a symbol (0..3) when a flick is detected, otherwise -1.
 // Method: a slow low-pass filter tracks gravity (the "baseline"); subtracting it leaves
 // only the motion. The board axes are first mapped to horizontal (h) and vertical (v)
-// using the orientation settings above. A flick = motion on h or v above FLICK_THRESHOLD.
-// The axis with the larger value and its sign give RIGHT/LEFT/UP/DOWN. A refractory
-// period stops the opposite "return swing" being counted as a second flick.
+// using the orientation settings above. A flick STARTS when h or v passes FLICK_THRESHOLD.
+// The peak on each axis is then tracked for CAPTURE_MS and the direction is chosen from the
+// strongest swing (not the first sample, which is often noise). It is only accepted if it
+// stays strong for MIN_SUSTAIN_SAMPLES (rejects cable tugs and knocks) and one axis clearly
+// beats the other (rejects diagonal movements). A refractory period stops the opposite
+// "return swing" being counted as a second flick.
 int8_t pollFlick() {
-  static unsigned long lastSample = 0, lastFlick = 0;
-  static float lpX = 0, lpY = 0;
-  static bool primed = false;
+  static unsigned long lastSample = 0, lastFlick = 0, capStart = 0;
+  static float lpX = 0, lpY = 0, pkH = 0, pkV = 0;
+  static bool capturing = false;
+  static uint8_t sustain = 0;
 
   if (millis() - lastSample < SAMPLE_MS) return -1;
   lastSample = millis();
 
   accel.read();
   float x = accel.X, y = accel.Y;
-  if (!primed) { lpX = x; lpY = y; primed = true; }
+  if (flickReset) { lpX = x; lpY = y; capturing = false; lastFlick = millis(); flickReset = false; }
   float hpX = x - lpX, hpY = y - lpY;
-  lpX += 0.1 * (x - lpX);
-  lpY += 0.1 * (y - lpY);
+  lpX += LP_ALPHA * (x - lpX);
+  lpY += LP_ALPHA * (y - lpY);
 
   float h = SWAP_AXES ? hpY : hpX;      // horizontal motion
   float v = SWAP_AXES ? hpX : hpY;      // vertical motion
@@ -187,17 +211,38 @@ int8_t pollFlick() {
   float av = v < 0 ? -v : v;
 
 #if TUNE_MODE
-  SerialMonitorInterface.print((int)h); SerialMonitorInterface.print(' ');
-  SerialMonitorInterface.println((int)v);
+  if (ah >= 25 || av >= 25) {           // only print real movement so the numbers are readable
+    SerialMonitorInterface.print("h="); SerialMonitorInterface.print((int)h);
+    SerialMonitorInterface.print(" v="); SerialMonitorInterface.println((int)v);
+  }
 #endif
 
-  if (millis() - lastFlick < REFRACTORY_MS) return -1;
-  float peak = (ah > av) ? ah : av;
-  if (peak < FLICK_THRESHOLD) return -1;
+  if (!capturing) {
+    if (millis() - lastFlick < REFRACTORY_MS) return -1;
+    if (ah < FLICK_THRESHOLD && av < FLICK_THRESHOLD) return -1;
+    capturing = true; capStart = millis(); pkH = h; pkV = v; sustain = 1;   // flick started: watch the peak for a moment
+    return -1;
+  }
 
+  // Keep the largest swing on each axis (with its sign) during the capture window
+  if (ah > (pkH < 0 ? -pkH : pkH)) pkH = h;
+  if (av > (pkV < 0 ? -pkV : pkV)) pkV = v;
+  if (ah >= SUSTAIN_THRESHOLD || av >= SUSTAIN_THRESHOLD) sustain++;
+  if (millis() - capStart < CAPTURE_MS) return -1;
+
+  capturing = false;
+  float aH = pkH < 0 ? -pkH : pkH;
+  float aV = pkV < 0 ? -pkV : pkV;
+#if TUNE_MODE
+  SerialMonitorInterface.print("FLICK pkH="); SerialMonitorInterface.print((int)pkH);
+  SerialMonitorInterface.print(" pkV=");      SerialMonitorInterface.print((int)pkV);
+  SerialMonitorInterface.print(" samples=");  SerialMonitorInterface.println(sustain);
+#endif
+  if (sustain < MIN_SUSTAIN_SAMPLES) return -1;   // too brief: cable tug or knock, not a deliberate flick
   lastFlick = millis();
-  if (ah >= av) return (h > 0) ? SYM_RIGHT : SYM_LEFT;
-  return (v > 0) ? SYM_UP : SYM_DOWN;
+  if (aH >= aV * DOMINANCE_RATIO) return (pkH > 0) ? SYM_RIGHT : SYM_LEFT;
+  if (aV >= aH * DOMINANCE_RATIO) return (pkV > 0) ? SYM_UP : SYM_DOWN;
+  return -1;                                      // diagonal / ambiguous: ignore rather than guess
 }
 
 // ---------------------------------------------------------------------------
@@ -235,11 +280,21 @@ void handleBleMessage() {
   if (type == 'C' && len == 17 && state != ST_ENROL) {
     memcpy(nonce, ble_rx_buffer + 1, 16);   // copy at once: the buffer is overwritten by the next write
     enteredCount = 0;
+    flickReset = true;
     state = ST_CHALLENGE;
     stateStart = millis();
     wakeScreen();
     buzz(80);
     showProgress("Unlock? Flick");
+  } else if (type == 'S' && len == 2) {
+    // Door status from the Pi: 'U' = unlocked, 'K' = locked
+    DoorState prev = doorState;
+    doorState = (ble_rx_buffer[1] == 'U') ? DOOR_UNLOCKED : DOOR_LOCKED;
+    if (state == ST_IDLE) {              // never interrupt a gesture or a result screen; the idle redraw shows it later
+      wakeScreen();
+      showIdle();
+      if (doorState == DOOR_UNLOCKED && prev != DOOR_UNLOCKED) { buzz(60); delay(80); buzz(60); }   // double pulse
+    }
   } else if (type == 'L') {
     state = ST_RESULT;
     stateStart = millis();
@@ -313,6 +368,7 @@ void checkButtons() {
     if (!wasOff && state == ST_IDLE && (buttons & TSButtonUpperLeft) && millis() < ENROL_WINDOW_MS) {
       state = ST_ENROL;
       enteredCount = 0;
+      flickReset = true;
       stateStart = millis();
       showProgress("Enrol: flick");
     } else if (wasOff && state == ST_IDLE) {
@@ -332,7 +388,7 @@ void setup() {
   pinMode(vibratePin, OUTPUT);
   digitalWrite(vibratePin, LOW);
 
-  if (accel.begin(BMA250_range_2g, BMA250_update_time_16ms) != 0) {
+  if (accel.begin(BMA250_range_2g, BMA250_update_time_4ms) != 0) {
     showScreen("ERROR", "No accel board", "check stack", TS_8b_Red);
     while (1) {}
   }
@@ -346,8 +402,10 @@ void loop() {
   aci_loop();            // BLE handler from UART.ino: must run often, keep loop short
   handleBleMessage();
 
-  int8_t sym = pollFlick();
-  if (sym >= 0 && (state == ST_CHALLENGE || state == ST_ENROL)) onFlick(sym);
+  if (state == ST_CHALLENGE || state == ST_ENROL) {   // idle: skip the accelerometer (saves battery)
+    int8_t sym = pollFlick();
+    if (sym >= 0) onFlick(sym);
+  }
 
   switch (state) {
     case ST_CHALLENGE:
@@ -364,7 +422,10 @@ void loop() {
       if (millis() - stateStart > 30000) { state = ST_IDLE; showIdle(); }   // give up quietly
       break;
     case ST_IDLE:
-      if (lastBleShown != ble_connection_state) { wakeScreen(); showIdle(); }   // wake + redraw when the link changes
+      if (lastBleShown != ble_connection_state) {
+        if (!ble_connection_state) doorState = DOOR_UNKNOWN;   // link lost: we no longer know the door state
+        wakeScreen(); showIdle();
+      }   // wake + redraw when the link changes
       if (displayOn && millis() - screenTimer > SCREEN_TIMEOUT_MS) { display.off(); displayOn = 0; }
       break;
   }
