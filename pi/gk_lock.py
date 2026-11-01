@@ -7,6 +7,7 @@ Protocol (matches GestureKey.ino):
   watch -> Pi : b'R' + 16 bytes          (= HMAC-SHA256(key, b'A' + nonce)[:16])  approved
                 b'N'                      denied (wrong gesture)
   Pi -> watch : b'L'                      locked out notice
+  Pi -> watch : b'T' + hour, minute, second  clock sync (watch has no battery-backed clock)
   Pi -> watch : b'S' + b'U' / b'K'        door status: unlocked / locked (shown on the watch's idle screen)
 
 Attribution: BLE UART UUIDs are the Nordic UART Service used by the TinyCircuits
@@ -31,6 +32,7 @@ KEY = bytes.fromhex(open(KEY_FILE).read().strip())
 RESPONSE_TIMEOUT_S = 15      # must be LONGER than the watch's CHALLENGE_TIMEOUT_MS (12 s) or the Pi gives up first
 MAX_FAILS = 3
 LOCKOUT_S = 30
+ALLOWED_HOURS = None         # optional, e.g. (7, 23) = only allow unlocks from 07:00 to 22:59. None = always allowed
 SEND_DOOR_STATUS = True    # tell the watch whether the door is locked or unlocked
 TEST_NO_LOCKOUT = True     # testing: wrong gestures never lock you out. Set False for the real demo
 UNLOCK_HOLD_S = 5
@@ -82,6 +84,21 @@ async def send_status(client, code: bytes):
     except Exception as e:
         print(f"[status] not sent ({e.__class__.__name__})")
 
+async def send_time(client):
+    """Set the watch clock from the Pi's local time. Never raises."""
+    t = time.localtime()
+    try:
+        await client.write_gatt_char(NUS_WRITE, bytes([ord("T"), t.tm_hour, t.tm_min, t.tm_sec]), response=False)
+    except Exception as e:
+        print(f"[time] not sent ({e.__class__.__name__})")
+
+def hours_allowed() -> bool:
+    if ALLOWED_HOURS is None:
+        return True
+    start, end = ALLOWED_HOURS
+    h = time.localtime().tm_hour
+    return (start <= h < end) if start < end else (h >= start or h < end)
+
 def on_notify(_sender, data: bytearray):
     if pending is not None and not pending.done():
         pending.set_result(bytes(data))
@@ -91,6 +108,10 @@ async def attempt(client):
     now = time.time()
     if now < locked_until:
         print(f"[locked out] try again in {int(locked_until - now)} s")
+        return
+
+    if not hours_allowed():
+        log("outside_hours", f"unlock refused, allowed {ALLOWED_HOURS[0]:02d}:00-{ALLOWED_HOURS[1]:02d}:00")
         return
 
     nonce = os.urandom(16)                    # fresh every time -> replayed responses are useless
@@ -124,6 +145,8 @@ async def attempt(client):
         await asyncio.sleep(UNLOCK_HOLD_S)
         set_lock(False)
         await send_status(client, b"K")
+        await asyncio.sleep(0.2)                 # one BLE write at a time: the watch has a single receive buffer
+        await send_time(client)                  # resync the clock after each unlock
     else:
         fails += 1
         log("fail", f"{why} ({fails}/{MAX_FAILS})")
@@ -163,6 +186,8 @@ async def session():
         await client.start_notify(NUS_NOTIFY, on_notify)
         log("connected", dev.address)
         await send_status(client, b"K")          # door is locked when we connect
+        await asyncio.sleep(0.2)
+        await send_time(client)                  # set the watch clock
         loop = asyncio.get_running_loop()
         while client.is_connected:
             await loop.run_in_executor(None, input, "Press Enter to request unlock > ")
@@ -186,5 +211,3 @@ if __name__ == "__main__":
         asyncio.run(list_devices() if "--scan" in sys.argv else main())
     except KeyboardInterrupt:
         print("\nstopped")
-
-        
