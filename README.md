@@ -63,11 +63,34 @@ python3 -c "import os;print(os.urandom(16).hex())"
 ```
 `gk_key.txt` holds the hex string; `secrets.h` holds the same bytes as a C array.
 
-## Telegram alerts
-The Pi sends a Telegram message on every unlock and when a lockout starts.
+## Telegram bot
+The Pi sends Telegram alerts and also accepts a few commands.
+
+**Alerts** (each message names the lock, e.g. "Front door"; set `GK_LOCK_NAME` to change it)
+- Unlock: time and confirmation that gesture + HMAC were verified
+- Each failed attempt: counter (1/3, 2/3) and the reason (wrong gesture, bad HMAC, ...)
+- Lockout: duration and the list of reasons for all 3 failures
+- Timeout (watch did not respond) and watch disconnect, rate-limited so they cannot spam you
+
+**Commands** (send these to your bot)
+| Command | What it does |
+|---|---|
+| `/status` | watch connected?, lockdown, lockout time left, failed attempts, last event |
+| `/log [n]` | last n events (default 5, max 10) |
+| `/lockdown` | block all unlock requests, even valid ones, until `/resume`. Survives a restart |
+| `/resume` | allow unlocking again |
+| `/help` | list commands |
+
+**Security:** a bot username is public, so anyone can message it. Commands are obeyed **only** from the
+chat id in `TELEGRAM_CHAT_ID`; every other chat is ignored with no reply. Messages sent while the
+script was offline are skipped at startup so an old `/lockdown` cannot fire later.
+Only one machine can read a bot's messages at a time, so teammates should use their own bots
+(or set `GK_TELEGRAM_COMMANDS=0` to turn commands off and keep alerts only).
+
+**Setup**
 1. Create a bot with **@BotFather** and copy the token.
 2. Send your bot any message, then open `https://api.telegram.org/bot<TOKEN>/getUpdates`
-   and read your chat id.
+   and read your chat id (`"chat":{"id":...}`). It is not the number at the front of the token.
 3. Set environment variables (never commit the token):
 ```
 # PowerShell
@@ -78,7 +101,7 @@ export TELEGRAM_BOT_TOKEN=...  TELEGRAM_CHAT_ID=...
 ```
 4. Check it works: `python3 gk_lock.py --test-telegram`
 
-If the variables are not set, alerts are skipped and the lock works as normal.
+If the variables are not set, alerts and commands are skipped and the lock works as normal.
 
 ## Tests
 ```
@@ -86,7 +109,9 @@ cd pi
 python -m unittest discover -s tests -v
 ```
 - `test_gk_lock.py`: verify, replay rejection, forged/wrong-key responses, timeouts, lockout and
-  expiry, Telegram alerts (fake watch, mocked network, no hardware needed).
+  expiry (fake watch, mocked network, no hardware needed).
+- `test_telegram_bot.py`: alert contents and rate limiting, every command, lockdown (including
+  surviving a restart), and the chat-id allow-list: strangers are ignored, the owner is obeyed.
 - `test_firmware_crypto.py`: compiles the watch's `gk_crypto.h` with gcc/clang and checks it matches
   Python's HMAC, including the RFC 4231 test vector. Skipped if no C compiler is installed.
 
