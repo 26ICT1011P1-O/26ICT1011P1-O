@@ -20,7 +20,7 @@
 //      same SmartWatch example.
 //    - Accelerometer polling pattern adapted from TinyScreen_FlappyBirds_accelero.
 //    - gk_crypto.h: SHA-256/HMAC implemented from FIPS 180-4 / RFC 2104.
-//    - Everything else (gesture detection, state machine, protocol): our own work.
+//    - Everything else (gesture detection, state machine, protocol, clock, countdown): our own work.
 //
 //  Files that must sit in this sketch folder: GestureKey.ino, UART.ino,
 //  BMA250.h, BMA250.cpp, gk_crypto.h, secrets.h
@@ -56,6 +56,10 @@ const float         SUSTAIN_THRESHOLD   = 60.0;   // a real flick stays above th
 const uint8_t       MIN_SUSTAIN_SAMPLES = 3;      // samples (10 ms each) that must reach SUSTAIN_THRESHOLD. 1 = most forgiving, 4 = strict
 const float         DOMINANCE_RATIO     = 1.3;    // winning axis must beat the other axis by this factor, else the flick is ignored as diagonal
 const float         LP_ALPHA            = 0.05;   // gravity baseline speed (smaller = slower)
+const uint8_t       REARM_SAMPLES       = 4;      // ...and stay below it for this many samples in a row (4 x 10 ms). One sample is not enough:
+                                                  // the signal passes through zero between a flick and its swing-back
+const float         REARM_THRESHOLD     = 40.0;   // before a new flick can start, the arm must settle below this. Stops the swing-back of a flick that was
+                                                  // missed (e.g. you flicked too soon after the buzz) being misread as a flick in the OPPOSITE direction. 9999 = off
 const unsigned long SAMPLE_MS           = 10;     // 100 Hz sampling
 const unsigned long CAPTURE_MS          = 60;     // after a flick starts, track the peak this long before choosing a direction
 const unsigned long REFRACTORY_MS       = 450;    // ignore the "return swing" after a flick
@@ -64,7 +68,9 @@ const unsigned long CHALLENGE_TIMEOUT_MS = 12000; // must stay BELOW RESPONSE_TI
 const unsigned long RESULT_SHOW_MS      = 2000;
 const unsigned long SCREEN_TIMEOUT_MS   = 15000;
 const unsigned long ENROL_WINDOW_MS     = 300000; // gesture can only be re-recorded this long after power-up (5 min)
-const uint8_t       GESTURE_LEN         = 1;
+// Number of flicks in the secret. With 4 directions there are 4^GESTURE_LEN combinations:
+// 1 flick = 4 (guessable in a few tries), 3 flicks = 64. Keep at 3 or more for real use.
+const uint8_t       GESTURE_LEN         = 3;
 
 // ---- orientation (set these during calibration so UP/DOWN/LEFT/RIGHT match how the watch is worn) ----
 const bool SWAP_AXES = false;   // true if the board's X axis is your up/down axis
@@ -74,9 +80,9 @@ const bool INVERT_V  = false;   // true if up/down come out reversed
 // Flick symbols: direction the watch is pushed
 enum { SYM_RIGHT = 0, SYM_LEFT = 1, SYM_UP = 2, SYM_DOWN = 3 };
 
-// Default gesture: one RIGHT flick.  Re-record with UPPER-LEFT button within 5 min of power-up.
+// Default gesture: RIGHT, RIGHT, DOWN.  Re-record with UPPER-LEFT button within 5 min of power-up.
 // (Kept in RAM only: the SAMD21 has no EEPROM, so it resets to this default on power cycle.)
-uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT };
+uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT, SYM_RIGHT, SYM_DOWN };
 
 // Debug aid: shows each detected flick direction on the watch. Set to false for the demo,
 // because it leaks the secret gesture.
@@ -220,20 +226,20 @@ void buzz(unsigned int ms) {
 // The peak on each axis is then tracked for CAPTURE_MS and the direction is chosen from the
 // strongest swing (not the first sample, which is often noise). It is only accepted if it
 // stays strong for MIN_SUSTAIN_SAMPLES (rejects cable tugs and knocks) and one axis clearly
-// beats the other (rejects diagonal movements). A refractory period stops the opposite
-// "return swing" being counted as a second flick.
+// beats the other (rejects diagonal movements). A refractory period, then a short "settle" check
+// (REARM_THRESHOLD), stop the opposite "return swing" being counted as a second flick.
 int8_t pollFlick() {
   static unsigned long lastSample = 0, lastFlick = 0, capStart = 0;
   static float lpX = 0, lpY = 0, pkH = 0, pkV = 0;
-  static bool capturing = false;
-  static uint8_t sustain = 0;
+  static bool capturing = false, armed = false;
+  static uint8_t sustain = 0, quiet = 0;
 
   if (millis() - lastSample < SAMPLE_MS) return -1;
   lastSample = millis();
 
   accel.read();
   float x = accel.X, y = accel.Y;
-  if (flickReset) { lpX = x; lpY = y; capturing = false; lastFlick = millis(); flickReset = false; }
+  if (flickReset) { lpX = x; lpY = y; capturing = false; armed = false; quiet = 0; lastFlick = millis(); flickReset = false; }
   float hpX = x - lpX, hpY = y - lpY;
   lpX += LP_ALPHA * (x - lpX);
   lpY += LP_ALPHA * (y - lpY);
@@ -254,8 +260,14 @@ int8_t pollFlick() {
 #endif
 
   if (!capturing) {
-    if (millis() - lastFlick < REFRACTORY_MS) return -1;
+    if (millis() - lastFlick < REFRACTORY_MS) { armed = false; quiet = 0; return -1; }
+    if (!armed) {                                   // wait for the arm to come to rest first (see REARM_THRESHOLD)
+      if (ah < REARM_THRESHOLD && av < REARM_THRESHOLD) { if (++quiet >= REARM_SAMPLES) armed = true; }
+      else quiet = 0;
+      return -1;
+    }
     if (ah < FLICK_THRESHOLD && av < FLICK_THRESHOLD) return -1;
+    armed = false; quiet = 0;                       // after this flick the arm must settle again before the next one
     capturing = true; capStart = millis(); pkH = h; pkV = v; sustain = 1;   // flick started: watch the peak for a moment
     return -1;
   }
