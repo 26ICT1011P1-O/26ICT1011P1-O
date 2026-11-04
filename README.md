@@ -30,6 +30,7 @@ pi/
   gk_notify.py         Telegram alerts, commands, approval buttons (standard library only)
   .env.example         template for pi/.env (token, chat id, options)
   dashboard.py         Flask page showing the access log
+  virtual_door.py      laptop window that acts as the door (see "Laptop door mode")
   gk_key.txt           shared key (hex) -- NOT in git
 ```
 
@@ -64,6 +65,34 @@ Generate a key and share it with teammates privately (not via GitHub):
 python3 -c "import os;print(os.urandom(16).hex())"
 ```
 `gk_key.txt` holds the hex string; `secrets.h` holds the same bytes as a C array.
+
+## Laptop door mode (proximity trigger)
+
+No Raspberry Pi needed for a demo: a laptop can act as the door. `gk_lock.py` scans for the watch's
+Bluetooth adverts, and when the signal gets strong enough (the watch is close) it connects and runs the
+normal unlock check by itself, with no Enter key. `virtual_door.py` is a window that shows the door:
+red LOCKED, green UNLOCKED (with a beep), and an orange flash when an attempt is refused.
+
+```powershell
+pip install bleak flask
+python gk_lock.py --scan            # note the watch's rssi when it is where you want "close" to be
+$env:GK_AUTO = "1"                  # or put GK_AUTO=1 in pi/.env
+python gk_lock.py                   # window 1: the lock logic
+python virtual_door.py              # window 2: the door
+```
+
+| Setting (in `pi/.env`) | Default | Meaning |
+|---|---|---|
+| `GK_AUTO` | off | `1` = proximity mode instead of pressing Enter |
+| `GK_NEAR_RSSI` | -65 | A signal stronger than this (closer to 0 dBm) counts as "at the door" |
+| `GK_FAR_RSSI` | -80 | A signal weaker than this counts as "walked away" |
+| `GK_AWAY_S` | 8 | Seconds without hearing the watch also count as "walked away" |
+
+After one check, the watch must walk away before it can trigger again. The checks themselves (gesture, HMAC,
+lockout, Telegram approval, allowed hours, lockdown) are unchanged, and `gk_lock.py` shares the door state with
+the window through `door_state.json`. Bluetooth signal strength is noisy and changes with walls, bodies and
+antenna position, so it is a rough distance, not a measurement. Proximity alone must never unlock the door: it
+only starts the challenge, and the gesture and HMAC still decide.
 
 ## Telegram bot
 The Pi sends Telegram alerts, accepts a few commands, and can require your approval as a second factor.
