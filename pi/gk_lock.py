@@ -80,6 +80,16 @@ APPROVAL_TIMEOUT_S = _env_float("GK_APPROVAL_TIMEOUT", 20)
 APPROVAL_FAIL_OPEN = os.environ.get("GK_APPROVAL_FAIL_OPEN") == "1"   # allow gesture-only if Telegram is unreachable
 DAILY_SUMMARY_AT = os.environ.get("GK_DAILY_SUMMARY_AT")              # e.g. "21:00" (24 h clock); unset = off
 
+# ---- proximity mode: the laptop is the door. No Enter key: the unlock check starts by itself when the
+# watch comes close (see auto_session). virtual_door.py shows the door state in a window. ----
+AUTO = os.environ.get("GK_AUTO") == "1"
+NEAR_RSSI = _env_float("GK_NEAR_RSSI", -70)    # dBm: a signal STRONGER (closer to 0) than this means "at the door"
+FAR_RSSI = _env_float("GK_FAR_RSSI", -75)      # dBm: weaker than this means "walked away"
+AWAY_S = _env_float("GK_AWAY_S", 2)            # seconds without hearing the watch also means "walked away"
+NEAR_READS = 3                                 # smooth over this many readings, because RSSI is noisy
+PROX_POLL_S = 0.5                              # how often the proximity check looks at the readings
+DOOR_STATE_FILE = os.environ.get("GK_DOOR_STATE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "door_state.json"))
+
 # ---- servo (falls back to printing when not on a Pi, so you can test on a laptop) ----
 try:
     from gpiozero import AngularServo
@@ -89,9 +99,20 @@ except Exception as e:
     _servo = None
     print(f"[servo] hardware not available ({e.__class__.__name__}); simulating")
 
+def _write_door_state(unlocked: bool):
+    """Tell virtual_door.py (the laptop door window) whether the door is open. Never raises."""
+    try:
+        tmp = DOOR_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"unlocked": unlocked, "t": time.time()}, f)
+        os.replace(tmp, DOOR_STATE_FILE)       # atomic, so the window never reads a half-written file
+    except OSError:
+        pass
+
 def set_lock(unlocked: bool):
     if _servo:
         _servo.angle = 90 if unlocked else 0
+    _write_door_state(unlocked)
     print("[lock]", "UNLOCKED" if unlocked else "locked")
 
 def log(event: str, detail: str = ""):
@@ -293,6 +314,8 @@ def check_startup() -> list:
             errors.append("GK_REQUIRE_APPROVAL=1 needs the Telegram listener (do not set GK_TELEGRAM_COMMANDS=0)")
         if os.environ.get("TELEGRAM_CHAT_ID", "").startswith("-"):
             errors.append("approvals need your PRIVATE chat id (a positive number), not a group chat id")
+    if AUTO and NEAR_RSSI <= FAR_RSSI:
+        errors.append("GK_NEAR_RSSI must be stronger (higher, e.g. -65) than GK_FAR_RSSI (e.g. -80)")
     if DAILY_SUMMARY_AT:
         try:
             seconds_until(DAILY_SUMMARY_AT)
@@ -431,6 +454,89 @@ async def session():
     log("disconnected")
     fire_alert(f"\U0001F4E1 {LOCK_NAME}: watch disconnected at {hms()}", key="disc", cooldown=60)
 
+async def auto_session():
+    """Proximity mode (GK_AUTO=1). Scans for the watch's adverts and watches how strong the signal is.
+    When it gets close (RSSI >= GK_NEAR_RSSI) it connects and runs the normal unlock check by itself.
+    It will not trigger again until the watch has walked away (weak signal, or silent for GK_AWAY_S)."""
+    from bleak import BleakScanner, BleakClient
+    global watch_connected, watch_addr
+    seen = {"dev": None, "t": time.time(), "rssi": []}
+
+    def on_advert(d, ad):
+        if ad.rssi is None:
+            return
+        if WATCH_ADDR:
+            if d.address.upper() != WATCH_ADDR.upper():
+                return
+        elif not is_watch(d, ad):
+            return
+        seen["dev"], seen["t"] = d, time.time()
+        seen["rssi"] = (seen["rssi"] + [ad.rssi])[-NEAR_READS:]
+
+    def mean_rssi():
+        return sum(seen["rssi"]) / len(seen["rssi"]) if seen["rssi"] else None
+
+    armed, last_print = True, 0.0
+    scanner = BleakScanner(detection_callback=on_advert)
+    await scanner.start()
+    print(f"[proximity] waiting for the watch. It must be closer than {NEAR_RSSI:.0f} dBm to start an unlock check.")
+    try:
+        while True:
+            await asyncio.sleep(PROX_POLL_S)
+            now = time.time()
+            avg = mean_rssi()
+            fresh = seen["dev"] is not None and now - seen["t"] < 3
+
+            if not armed:                                    # after a check: the watch must leave before it can trigger again
+                if now - seen["t"] >= AWAY_S or (fresh and avg is not None and avg < FAR_RSSI):
+                    armed = True
+                    seen["rssi"] = []
+                    print("[proximity] watch has walked away, armed again")
+                elif now - last_print > 5:
+                    last_print = now
+                    print("[proximity] waiting for the watch to walk away before it can unlock again...")
+                continue
+
+            if not (fresh and avg is not None and len(seen["rssi"]) >= NEAR_READS):
+                continue
+            if avg < NEAR_RSSI:
+                if now - last_print > 3:                     # handy for choosing GK_NEAR_RSSI
+                    last_print = now
+                    print(f"[proximity] watch at {avg:.0f} dBm, needs {NEAR_RSSI:.0f} or stronger")
+                continue
+
+            dev = seen["dev"]
+            print(f"[proximity] watch is close ({avg:.0f} dBm): starting the unlock check")
+            log("proximity", f"watch near ({avg:.0f} dBm)")
+            await scanner.stop()                             # do not scan while connecting
+            attempted = False
+            try:
+                async with BleakClient(dev) as client:
+                    await client.start_notify(NUS_NOTIFY, on_notify)
+                    watch_connected, watch_addr = True, dev.address
+                    log("connected", dev.address)
+                    await send_status(client, b"K")
+                    await asyncio.sleep(BLE_GAP_S)
+                    await send_time(client)
+                    await asyncio.sleep(BLE_GAP_S)
+                    attempted = True
+                    await attempt(client)                    # same checks as before: gesture, HMAC, lockout, approval...
+            except Exception as e:
+                print("[proximity] the check did not complete:", repr(e))
+                await asyncio.sleep(3)
+            finally:
+                watch_connected = False
+                log("disconnected")
+                if attempted:
+                    armed = False                            # once per visit: wait for the watch to leave
+                seen["rssi"], seen["t"] = [], time.time()
+                await scanner.start()
+    finally:
+        try:
+            await scanner.stop()
+        except Exception:
+            pass
+
 async def main():
     problems = check_startup()
     if problems:
@@ -441,6 +547,9 @@ async def main():
         gk_notify.CommandListener(handle_command, callback_handler=handle_callback).start()
         print("[telegram] commands enabled (/status /log /summary /lockdown /resume /help); "
               "only your own chat is obeyed. Set GK_TELEGRAM_COMMANDS=0 to turn off.")
+    _write_door_state(False)                # the laptop door window starts locked
+    if AUTO:
+        print(f"[proximity] mode ON: no Enter key. Start virtual_door.py in a second window to see the door.")
     if TEST_NO_LOCKOUT:
         print("[WARNING] GK_TEST_NO_LOCKOUT is ON: failed attempts never lock you out. Turn it off for the real demo.")
     if REQUIRE_APPROVAL:
@@ -451,7 +560,7 @@ async def main():
         print(f"[summary] daily summary at {DAILY_SUMMARY_AT}")
     while True:
         try:
-            await session()
+            await (auto_session() if AUTO else session())
         except Exception as e:
             print("[error]", repr(e))
         await asyncio.sleep(3)      # then rescan / reconnect
