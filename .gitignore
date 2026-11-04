@@ -1,5 +1,7 @@
-GestureKey/secrets.h
-pi/gk_key.txt
-pi/access_log.jsonl
-pi/access_log.jsonl.lockdown
-pi/.env
+**/secrets.h
+**/gk_key.txt
+**/.env
+**/access_log.jsonl*
+**/door_state.json*
+**/__pycache__/
+*.pyc
