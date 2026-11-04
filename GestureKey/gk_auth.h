@@ -18,7 +18,7 @@
 #define GK_TAG_LEN   16
 #define GK_NONCE_LEN 16
 
-static void gk_tag(const uint8_t *key, uint32_t keyLen, uint8_t label,
+static inline void gk_tag(const uint8_t *key, uint32_t keyLen, uint8_t label,
                    const uint8_t *a, uint8_t aLen, const uint8_t *b, uint8_t bLen,
                    uint8_t out[GK_TAG_LEN]) {
   uint8_t msg[1 + 2 * GK_NONCE_LEN];
@@ -32,22 +32,22 @@ static void gk_tag(const uint8_t *key, uint32_t keyLen, uint8_t label,
 }
 
 // Compare without stopping at the first difference. Returns 1 if equal.
-static int gk_ct_equal(const uint8_t *a, const uint8_t *b, uint8_t n) {
+static inline int gk_ct_equal(const uint8_t *a, const uint8_t *b, uint8_t n) {
   uint8_t d = 0;
   for (uint8_t i = 0; i < n; i++) d |= (uint8_t)(a[i] ^ b[i]);
   return d == 0;
 }
 
-static void gk_tag_P(const uint8_t *k, uint32_t kl, const uint8_t *wn, const uint8_t *pn, uint8_t out[GK_TAG_LEN]) {
+static inline void gk_tag_P(const uint8_t *k, uint32_t kl, const uint8_t *wn, const uint8_t *pn, uint8_t out[GK_TAG_LEN]) {
   gk_tag(k, kl, 'P', wn, GK_NONCE_LEN, pn, GK_NONCE_LEN, out);
 }
-static void gk_tag_A(const uint8_t *k, uint32_t kl, const uint8_t *wn, const uint8_t *pn, uint8_t out[GK_TAG_LEN]) {
+static inline void gk_tag_A(const uint8_t *k, uint32_t kl, const uint8_t *wn, const uint8_t *pn, uint8_t out[GK_TAG_LEN]) {
   gk_tag(k, kl, 'A', wn, GK_NONCE_LEN, pn, GK_NONCE_LEN, out);
 }
-static void gk_tag_O(const uint8_t *k, uint32_t kl, const uint8_t *ln, uint8_t out[GK_TAG_LEN]) {
+static inline void gk_tag_O(const uint8_t *k, uint32_t kl, const uint8_t *ln, uint8_t out[GK_TAG_LEN]) {
   gk_tag(k, kl, 'O', ln, GK_NONCE_LEN, 0, 0, out);
 }
-static void gk_tag_Y(const uint8_t *k, uint32_t kl, const uint8_t *ln, uint8_t out[GK_TAG_LEN]) {
+static inline void gk_tag_Y(const uint8_t *k, uint32_t kl, const uint8_t *ln, uint8_t out[GK_TAG_LEN]) {
   gk_tag(k, kl, 'Y', ln, GK_NONCE_LEN, 0, 0, out);
 }
 
@@ -55,7 +55,7 @@ static void gk_tag_Y(const uint8_t *k, uint32_t kl, const uint8_t *ln, uint8_t o
 //   HMAC-SHA256(secret key, 'N' || counter || two timer readings)[:16].
 // Without the key nobody can predict it (even knowing the timer values); the counter and the
 // timers make sure it is never the same twice.
-static void gk_make_nonce(const uint8_t *key, uint32_t keyLen, uint32_t counter,
+static inline void gk_make_nonce(const uint8_t *key, uint32_t keyLen, uint32_t counter,
                           uint32_t t1, uint32_t t2, uint8_t out[GK_NONCE_LEN]) {
   uint8_t msg[13];
   msg[0] = 'N';

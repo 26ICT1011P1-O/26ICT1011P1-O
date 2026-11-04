@@ -2,13 +2,14 @@
 """
 gk_lock.py - Raspberry Pi side of GestureKey (BLE central + lock controller)
 
-Protocol (matches GestureKey.ino):
-  Pi -> watch : b'C' + 16 random bytes   (challenge)
-  watch -> Pi : b'R' + 16 bytes          (= HMAC-SHA256(key, b'A' + nonce)[:16])  approved
-                b'N'                      denied (wrong gesture)
-  Pi -> watch : b'L'                      locked out notice
-  Pi -> watch : b'T' + hour, minute, second  clock sync (watch has no battery-backed clock)
-  Pi -> watch : b'S' + b'U' / b'K'        door status: unlocked / locked (shown on the watch's idle screen)
+Two BLE devices, one laptop in charge (full message list in gk_proto.py):
+
+  WATCH  (gesture)   laptop 'Q' -> watch 'Z'+wn | laptop 'C'+pn, 'M'+tag_P(wn,pn) | watch 'R'+tag_A(wn,pn) or 'N'
+                     laptop may add 'W'+secs (approve on phone), 'D'+code (decision), 'L', 'T', 'S'
+  LOCK   (servo)     laptop 'Q' -> lock 'Z'+ln | laptop 'O'+tag_O(ln) -> lock 'Y'+tag_Y(ln) or 'X'; lock closes itself
+
+  The watch only prompts for a gesture after the laptop proves it knows the key (mutual authentication),
+  and the lock only moves after the laptop proves it knows the key for a nonce the LOCK just chose.
 
 Attribution: BLE UART UUIDs are the Nordic UART Service used by the TinyCircuits
 SmartWatch example. BLE client uses the 'bleak' library; servo uses 'gpiozero'.
@@ -19,9 +20,10 @@ Run:  pip install bleak gpiozero pigpio
       python3 gk_lock.py --test-telegram   (check Telegram alert setup)
       python3 gk_lock.py            (press Enter to request an unlock)
 """
-import asyncio, datetime, hmac, hashlib, json, os, secrets, sys, time, warnings
+import asyncio, contextlib, datetime, hmac, hashlib, json, os, secrets, sys, time, warnings
 from collections import Counter
 import gk_notify                    # Telegram alerts (see gk_notify.py)
+import gk_proto                     # wire protocol: tags and nonces (twin of the firmware's gk_auth.h)
 warnings.filterwarnings("ignore")   # silence gpiozero pin-factory warnings when not on a Pi
 
 # Optional pi/.env (git-ignored) holds the Telegram token etc. Real environment variables win.
@@ -29,13 +31,16 @@ _n = gk_notify.load_env_file(os.path.join(os.path.dirname(os.path.abspath(__file
 if _n:
     print(f"[config] loaded {_n} setting(s) from .env")
 
-NAME_PREFIX = "GKey"                                   # advertised name set in UART.ino
+NAME_PREFIX = "GKey"                                   # the WATCH's advertised name (set in its UART.ino)
+LOCK_PREFIX = "GLock"                                  # the LOCK's advertised name (set in LockKey/UART.ino)
 NUS_WRITE  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"    # watch receives challenges here
 NUS_NOTIFY = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"    # watch sends responses here
 KEY_FILE = os.environ.get("GK_KEY_FILE", os.path.join(os.path.dirname(__file__), "gk_key.txt"))
 KEY = bytes.fromhex(open(KEY_FILE).read().strip())
 
-RESPONSE_TIMEOUT_S = 15      # must be LONGER than the watch's CHALLENGE_TIMEOUT_MS (12 s) or the Pi gives up first
+RESPONSE_TIMEOUT_S = 15      # must be LONGER than the watch's CHALLENGE_TIMEOUT_MS (12 s) or the laptop gives up first
+HANDSHAKE_TIMEOUT_S = 3      # how long to wait for a device's nonce
+LOCK_TIMEOUT_S = 5           # how long to wait for the lock to confirm it opened
 MAX_FAILS = 3
 LOCKOUT_S = 30
 UNLOCK_HOLD_S = 5
@@ -44,6 +49,10 @@ LOG_FILE = os.environ.get("GK_LOG_FILE", os.path.join(os.path.dirname(__file__),
 WATCH_ADDR = os.environ.get("GK_ADDR")      # optional: skip name matching, connect by address
 LOCK_NAME = os.environ.get("GK_LOCK_NAME", "Front door")   # shown in every Telegram message
 LOCKDOWN_FILE = LOG_FILE + ".lockdown"      # exists = lockdown on (survives a restart)
+STATE_FILE = LOG_FILE + ".state"            # failure / timeout counters and lockout end time (survive a restart)
+LOCK_ADDR = os.environ.get("GK_LOCK_ADDR")  # optional: connect to the lock by address
+# 'ble' = a second TinyScreen+ with the servo shield is the lock;  'sim' = just print UNLOCKED (testing, or a Pi servo)
+ACTUATOR = os.environ.get("GK_ACTUATOR", "sim").lower()
 
 def _env_float(name: str, default: float) -> float:
     """Read a number from the environment; a typo gives a clear message instead of a traceback."""
@@ -53,6 +62,9 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         print(f"[config error] {name} must be a number, but it is {raw!r}")
         raise SystemExit(2)
+
+def _env_int(name: str, default: int) -> int:
+    return int(_env_float(name, default))
 
 def _parse_hours(raw):
     """'7-23' -> (7, 23): unlocks allowed from 07:00 to 22:59. '22-6' wraps past midnight. Empty -> None."""
@@ -69,6 +81,9 @@ def _parse_hours(raw):
 
 ALLOWED_HOURS = _parse_hours(os.environ.get("GK_ALLOWED_HOURS"))   # None = unlocks allowed at any time
 SEND_DOOR_STATUS = True      # tell the watch whether the door is locked or unlocked
+# Challenges nobody answered, in a row. Reaching this triggers a lockout, so an attacker cannot keep
+# requesting challenges forever. 0 = unanswered challenges never cause a lockout.
+MAX_TIMEOUTS = _env_int("GK_MAX_TIMEOUTS", 5)
 BLE_GAP_S = 0.2              # pause between BLE writes: the watch has a single receive buffer
 # Testing aid: failed attempts never lock you out. OFF by default, so the lockout (and its Telegram
 # alert) works in the real demo. Turn on with GK_TEST_NO_LOCKOUT=1 in pi/.env while testing.
@@ -116,9 +131,9 @@ def fire_alert(text: str, key: str = None, cooldown: float = 0.0):
         print(f"[alert] could not queue ({e.__class__.__name__})")
 
 fails = 0
+timeouts = 0             # consecutive challenges nobody answered
 fail_reasons = []        # why each recent attempt failed (shown in the lockout alert)
 locked_until = 0.0
-pending = None          # Future for the challenge currently in flight (one at a time)
 watch_connected = False
 watch_addr = ""
 approval = {}            # the one approval request in flight: id, future, loop
@@ -190,10 +205,12 @@ def handle_command(cmd: str, args: str) -> str:
         return "\n".join([
             f"{LOCK_NAME} status",
             "Watch: " + (f"connected ({watch_addr})" if watch_connected else "NOT connected"),
+            *(["Lock: " + ("connected" if lock.connected else "NOT connected")] if ACTUATOR == "ble" else []),
             "Lockdown: " + ("ON" if lockdown else "off"),
             *([f"Allowed hours: {ALLOWED_HOURS[0]:02d}:00-{ALLOWED_HOURS[1]:02d}:00"] if ALLOWED_HOURS else []),
             "Lockout: " + (f"{remaining} s left" if remaining > 0 else "none"),
             f"Failed attempts: {fails}/{MAX_FAILS}",
+            *([f"Unanswered challenges: {timeouts}/{MAX_TIMEOUTS}"] if MAX_TIMEOUTS else []),
             "Last event: " + (fmt_row(last[0]) if last else "(none yet)"),
         ])
     if cmd == "log":
@@ -213,9 +230,83 @@ def handle_command(cmd: str, args: str) -> str:
         return "Lockdown off. Unlocking is allowed again."
     return "Unknown command. Try /help"
 
-def on_notify(_sender, data: bytearray):
-    if pending is not None and not pending.done():
-        pending.set_result(bytes(data))
+# ---- one BLE peripheral = one Link: send writes, wait for notifications ----
+class Link:
+    def __init__(self, name: str):
+        self.name = name
+        self.client = None
+        self._q = None
+
+    @property
+    def connected(self) -> bool:
+        return self.client is not None and bool(getattr(self.client, "is_connected", True))
+
+    def flush(self):
+        """Forget anything received so far (call before a new request so stale replies cannot be mistaken for answers)."""
+        self._q = asyncio.Queue()
+
+    def on_notify(self, _sender, data):
+        if self._q is not None:
+            self._q.put_nowait(bytes(data))
+
+    async def send(self, data: bytes):
+        await self.client.write_gatt_char(NUS_WRITE, data, response=False)
+
+    async def expect(self, kinds: bytes, timeout: float):
+        """Wait for a notification whose first byte is one of `kinds`. Returns it, or None on timeout."""
+        if self._q is None:
+            self.flush()
+        end = time.monotonic() + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                msg = await asyncio.wait_for(self._q.get(), left)
+            except asyncio.TimeoutError:
+                return None
+            if msg and msg[:1] in kinds:
+                return msg
+
+watch = Link("watch")
+lock = Link("lock")
+
+async def safe_send(link: Link, data: bytes):
+    """Write, but never raise: a dropped link must not crash an unlock attempt."""
+    try:
+        await link.send(data)
+    except Exception as e:
+        print(f"[{link.name}] message {data[:1]!r} not sent ({e.__class__.__name__})")
+
+# ---- counters that survive a restart (otherwise restarting the script would reset the lockout) ----
+def save_state():
+    data = {"fails": fails, "timeouts": timeouts, "locked_until": locked_until,
+            "reasons": list(fail_reasons)[-10:]}
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATE_FILE)              # atomic: a crash cannot leave half a file
+    except OSError as e:
+        print(f"[state] could not save ({e.__class__.__name__})")
+
+def load_state():
+    """Restore counters. A damaged or missing file is ignored; an expired lockout is dropped."""
+    global fails, timeouts, locked_until
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        f_, t_, lu = int(d.get("fails", 0)), int(d.get("timeouts", 0)), float(d.get("locked_until", 0))
+        reasons = [str(r) for r in d.get("reasons", [])][-10:]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+    fails = max(0, min(f_, MAX_FAILS - 1))
+    timeouts = max(0, min(t_, MAX_TIMEOUTS - 1)) if MAX_TIMEOUTS else 0
+    locked_until = lu if lu > time.time() else 0.0
+    fail_reasons[:] = reasons[:fails]
+    if fails or timeouts or locked_until:
+        print(f"[state] restored: {fails} failed, {timeouts} unanswered"
+              + (f", lockout {int(locked_until - time.time())} s left" if locked_until else ""))
 
 # ---- extras for the watch display: door status, clock sync, allowed hours (added by a teammate) ----
 async def send_status(client, code: bytes):
@@ -293,6 +384,8 @@ def check_startup() -> list:
             errors.append("GK_REQUIRE_APPROVAL=1 needs the Telegram listener (do not set GK_TELEGRAM_COMMANDS=0)")
         if os.environ.get("TELEGRAM_CHAT_ID", "").startswith("-"):
             errors.append("approvals need your PRIVATE chat id (a positive number), not a group chat id")
+    if ACTUATOR not in ("sim", "ble"):
+        errors.append(f"GK_ACTUATOR must be 'sim' or 'ble', but it is {ACTUATOR!r}")
     if DAILY_SUMMARY_AT:
         try:
             seconds_until(DAILY_SUMMARY_AT)
@@ -300,8 +393,81 @@ def check_startup() -> list:
             errors.append(f"GK_DAILY_SUMMARY_AT={DAILY_SUMMARY_AT!r} is not a valid HH:MM time")
     return errors
 
+# ---- messages to the watch about what happens after the gesture ----
+async def send_waiting(seconds: int):
+    """Tell the watch to show 'Approve on phone' with a countdown."""
+    await safe_send(watch, b"W" + bytes([max(1, min(255, seconds))]))
+
+async def send_decision(code: bytes):
+    """N = denied by owner, T = approval timed out, X = phone unreachable, F = lock error."""
+    await safe_send(watch, b"D" + code)
+
+async def start_lockout(reason_text: str):
+    global locked_until, fails, timeouts
+    locked_until = time.time() + LOCKOUT_S
+    fails = 0
+    timeouts = 0
+    log("lockout", f"{LOCKOUT_S} s")
+    fire_alert(f"\U0001F6A8 {LOCK_NAME}: LOCKED OUT for {LOCKOUT_S} s at {hms()}\n{reason_text}")
+    fail_reasons.clear()
+    await safe_send(watch, b"L")
+
+async def register_timeout(reason: str):
+    """A challenge nobody answered. Several in a row cause a lockout too."""
+    global timeouts
+    log("timeout", reason)
+    fire_alert(f"\u23F1 {LOCK_NAME}: unlock requested at {hms()} but the watch did not respond",
+               key="timeout", cooldown=30)
+    if MAX_TIMEOUTS and not TEST_NO_LOCKOUT:
+        timeouts += 1
+        if timeouts >= MAX_TIMEOUTS:
+            await start_lockout(f"{MAX_TIMEOUTS} challenges in a row went unanswered")
+
+async def watch_handshake():
+    """Mutual authentication with the watch: it picks a nonce, we pick one, we prove we know the key.
+    Returns (wn, pn), or None if the watch did not answer."""
+    watch.flush()
+    await watch.send(b"Q")
+    z = await watch.expect(b"Z", HANDSHAKE_TIMEOUT_S)
+    if z is None or len(z) != 1 + gk_proto.NONCE_LEN:
+        return None
+    wn, pn = z[1:], gk_proto.new_nonce()
+    await watch.send(b"C" + pn)
+    await asyncio.sleep(BLE_GAP_S)                   # one BLE write at a time: the device has a single receive buffer
+    await watch.send(b"M" + gk_proto.tag_P(KEY, wn, pn))
+    return wn, pn
+
+async def actuate() -> bool:
+    """Open the lock. In 'ble' mode the lock stack only moves after we prove we know the key for a nonce
+    IT just chose, and it confirms with its own tag. Returns True once the door is really open."""
+    if ACTUATOR != "ble":
+        set_lock(True)
+        return True
+    try:
+        lock.flush()
+        await lock.send(b"Q")
+        z = await lock.expect(b"Z", HANDSHAKE_TIMEOUT_S)
+        if z is None or len(z) != 1 + gk_proto.NONCE_LEN:
+            return False
+        ln = z[1:]
+        await lock.send(b"O" + gk_proto.tag_O(KEY, ln))
+        y = await lock.expect(b"YX", LOCK_TIMEOUT_S)
+    except Exception as e:
+        print(f"[lock] error ({e.__class__.__name__})")
+        return False
+    return (y is not None and y[:1] == b"Y" and len(y) == 1 + gk_proto.TAG_LEN
+            and gk_proto.equal(y[1:], gk_proto.tag_Y(KEY, ln)))
+
 async def attempt(client):
-    global fails, locked_until, pending
+    """One unlock attempt. `client` is the watch's BLE client (the lock's is lock.client)."""
+    watch.client = client
+    try:
+        await _attempt()
+    finally:
+        save_state()
+
+async def _attempt():
+    global fails, timeouts
     if lockdown:
         print("[lockdown] unlock requests are blocked (send /resume in Telegram)")
         log("blocked", "lockdown active")
@@ -319,31 +485,34 @@ async def attempt(client):
                    key="hours", cooldown=60)
         return
 
-    nonce = os.urandom(16)                    # fresh every time -> replayed responses are useless
-    pending = asyncio.get_running_loop().create_future()
-    await client.write_gatt_char(NUS_WRITE, b"C" + nonce, response=False)
+    if ACTUATOR == "ble" and not lock.connected:
+        log("lock_offline", "lock stack not connected; unlock refused")
+        fire_alert(f"\u26A0\uFE0F {LOCK_NAME}: unlock refused because the lock is not connected", key="lock_offline", cooldown=60)
+        return
+
+    hs = await watch_handshake()
+    if hs is None:
+        await register_timeout("watch did not answer the handshake")
+        return
+    wn, pn = hs
     print("[challenge sent] waiting for gesture on the watch...")
 
-    try:
-        resp = await asyncio.wait_for(pending, RESPONSE_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        log("timeout", "no response from watch")
-        fire_alert(f"\u23F1 {LOCK_NAME}: unlock requested at {hms()} but the watch did not respond",
-                   key="timeout", cooldown=30)
+    resp = await watch.expect(b"RN", RESPONSE_TIMEOUT_S)
+    if resp is None:
+        await register_timeout("no response from watch")
         return
-    finally:
-        pending = None
+    timeouts = 0                                       # the watch answered, so the unanswered streak is over
 
     if resp[:1] == b"N":
         ok = False; why = "wrong gesture"
-    elif resp[:1] == b"R" and len(resp) == 17:
-        expected = hmac.new(KEY, b"A" + nonce, hashlib.sha256).digest()[:16]
-        ok = hmac.compare_digest(resp[1:], expected)      # constant-time compare
+    elif resp[:1] == b"R" and len(resp) == 1 + gk_proto.TAG_LEN:
+        ok = gk_proto.equal(resp[1:], gk_proto.tag_A(KEY, wn, pn))     # constant-time compare
         why = "" if ok else "bad HMAC"
     else:
         ok = False; why = "malformed response"
 
     if ok and REQUIRE_APPROVAL:
+        await send_waiting(int(APPROVAL_TIMEOUT_S))     # the watch shows "Approve on phone" + countdown
         decision = await request_approval()
         if decision == "unavailable" and APPROVAL_FAIL_OPEN:
             log("approval_unavailable", "Telegram unreachable; gesture-only unlock (fail-open is ON)")
@@ -356,20 +525,28 @@ async def attempt(client):
             if decision == "unavailable":
                 fire_alert(f"\u26A0\uFE0F {LOCK_NAME}: unlock needed approval but Telegram was unreachable. Door stays locked.",
                            key="approval_unavailable", cooldown=60)
+            await send_decision({"denied": b"N", "timeout": b"T"}.get(decision, b"X"))
             return
+
     if ok:
+        if not await actuate():
+            log("lock_error", "gesture and HMAC were fine but the lock did not open")
+            fire_alert(f"\U0001F6A8 {LOCK_NAME}: gesture OK but the LOCK did not open. Check the lock stack.",
+                       key="lock_error", cooldown=30)
+            await send_decision(b"F")
+            return
         fails = 0
         fail_reasons.clear()
         log("unlock", "gesture + HMAC verified" + (" + owner approval" if REQUIRE_APPROVAL else ""))
         if not REQUIRE_APPROVAL:                        # with approval, the edited approval message already says so
             fire_alert(f"\u2705 {LOCK_NAME}: UNLOCKED at {hms()}\nGesture and HMAC verified.")
-        set_lock(True)
-        await send_status(client, b"U")
-        await asyncio.sleep(UNLOCK_HOLD_S)
-        set_lock(False)
-        await send_status(client, b"K")
-        await asyncio.sleep(BLE_GAP_S)                 # one BLE write at a time: the watch has a single receive buffer
-        await send_time(client)                  # resync the clock after each unlock
+        await send_status(watch.client, b"U")
+        await asyncio.sleep(UNLOCK_HOLD_S)               # in 'ble' mode the lock closes itself after the same time
+        if ACTUATOR != "ble":
+            set_lock(False)
+        await send_status(watch.client, b"K")
+        await asyncio.sleep(BLE_GAP_S)                   # one BLE write at a time: the watch has a single receive buffer
+        await send_time(watch.client)                    # resync the clock after each unlock
     else:
         fails += 1
         fail_reasons.append(why)
@@ -380,20 +557,20 @@ async def attempt(client):
             fails = 0                            # no lockout while testing; keep the counter from running past the limit
             fail_reasons.clear()
         elif fails >= MAX_FAILS:
-            locked_until = time.time() + LOCKOUT_S
-            fails = 0
-            log("lockout", f"{LOCKOUT_S} s")
-            fire_alert(f"\U0001F6A8 {LOCK_NAME}: LOCKED OUT for {LOCKOUT_S} s at {hms()}\n"
-                       f"{MAX_FAILS} failed attempts: " + ", ".join(fail_reasons))
-            fail_reasons.clear()
-            await client.write_gatt_char(NUS_WRITE, b"L", response=False)
+            await start_lockout(f"{MAX_FAILS} failed attempts: " + ", ".join(fail_reasons))
         else:
             fire_alert(f"\u26A0\uFE0F {LOCK_NAME}: failed unlock attempt {fails}/{MAX_FAILS} at {hms()}\n"
                        f"Reason: {why}")
 
+def _named(d, ad, prefix):
+    # Check BOTH names: the OS may cache an old device name while the fresh advert says the new one
+    return any((n or "").startswith(prefix) for n in (d.name, ad.local_name))
+
 def is_watch(d, ad):
-    # Check BOTH names: the OS may cache an old device name while the fresh advert says GKey
-    return any((n or "").startswith(NAME_PREFIX) for n in (d.name, ad.local_name))
+    return _named(d, ad, NAME_PREFIX)
+
+def is_lock(d, ad):
+    return _named(d, ad, LOCK_PREFIX)
 
 async def list_devices():
     """Debug helper: python gk_lock.py --scan  -> prints every BLE device seen for 10 s."""
@@ -404,32 +581,58 @@ async def list_devices():
         print(f"  {addr}  rssi={ad.rssi}  name={d.name!r}  local_name={ad.local_name!r}")
     print(f"[scan] {len(found)} devices")
 
+async def find_devices(need_lock: bool, scan_s: float = 8):
+    """Scan once and pick the watch (and the lock). Addresses from GK_ADDR / GK_LOCK_ADDR win over names."""
+    from bleak import BleakScanner
+    found = await BleakScanner.discover(timeout=scan_s, return_adv=True)
+    wdev = ldev = None
+    for addr, (d, ad) in found.items():
+        if WATCH_ADDR and addr.upper() == WATCH_ADDR.upper():
+            wdev = d
+        elif not WATCH_ADDR and is_watch(d, ad):
+            wdev = wdev or d
+        if need_lock:
+            if LOCK_ADDR and addr.upper() == LOCK_ADDR.upper():
+                ldev = d
+            elif not LOCK_ADDR and is_lock(d, ad):
+                ldev = ldev or d
+    return wdev, ldev
+
 async def session():
-    from bleak import BleakScanner, BleakClient
-    print("[scan] looking for the watch...")
-    if WATCH_ADDR:
-        dev = await BleakScanner.find_device_by_address(WATCH_ADDR, timeout=20)
-    else:
-        dev = await BleakScanner.find_device_by_filter(is_watch, timeout=20)
-    if dev is None:
-        print("[scan] not found"); return
+    from bleak import BleakClient
     global watch_connected, watch_addr
+    need_lock = ACTUATOR == "ble"
+    print("[scan] looking for the watch" + (" and the lock" if need_lock else "") + "...")
+    wdev, ldev = await find_devices(need_lock)
+    if wdev is None or (need_lock and ldev is None):
+        print("[scan] not found:" + ("" if wdev else " watch") + ("" if (ldev or not need_lock) else " lock"))
+        return
     try:
-        async with BleakClient(dev) as client:
-            await client.start_notify(NUS_NOTIFY, on_notify)
-            watch_connected, watch_addr = True, dev.address
-            log("connected", dev.address)
-            await send_status(client, b"K")      # door is locked when we connect
+        async with contextlib.AsyncExitStack() as stack:
+            wc = await stack.enter_async_context(BleakClient(wdev))
+            await wc.start_notify(NUS_NOTIFY, watch.on_notify)
+            watch.client = wc
+            if need_lock:
+                lc = await stack.enter_async_context(BleakClient(ldev))
+                await lc.start_notify(NUS_NOTIFY, lock.on_notify)
+                lock.client = lc
+            watch_connected, watch_addr = True, wdev.address
+            log("connected", wdev.address + (f" + lock {ldev.address}" if need_lock else ""))
+            await send_status(wc, b"K")          # door is locked when we connect
             await asyncio.sleep(BLE_GAP_S)
-            await send_time(client)              # set the watch clock
+            await send_time(wc)                  # set the watch clock
             loop = asyncio.get_running_loop()
-            while client.is_connected:
+            while watch.connected and (not need_lock or lock.connected):
                 await loop.run_in_executor(None, input, "Press Enter to request unlock > ")
-                await attempt(client)
+                await attempt(wc)
     finally:
         watch_connected = False
+        watch.client = lock.client = None
     log("disconnected")
-    fire_alert(f"\U0001F4E1 {LOCK_NAME}: watch disconnected at {hms()}", key="disc", cooldown=60)
+    fire_alert(f"\U0001F4E1 {LOCK_NAME}: watch" + (" or lock" if need_lock else "") + f" disconnected at {hms()}",
+               key="disc", cooldown=60)
+
+load_state()
 
 async def main():
     problems = check_startup()
@@ -441,6 +644,8 @@ async def main():
         gk_notify.CommandListener(handle_command, callback_handler=handle_callback).start()
         print("[telegram] commands enabled (/status /log /summary /lockdown /resume /help); "
               "only your own chat is obeyed. Set GK_TELEGRAM_COMMANDS=0 to turn off.")
+    print(f"[lock] actuator = {ACTUATOR}" + (" (second TinyScreen+ with the servo shield)" if ACTUATOR == "ble"
+                                          else " (simulated: prints UNLOCKED, no real lock)"))
     if TEST_NO_LOCKOUT:
         print("[WARNING] GK_TEST_NO_LOCKOUT is ON: failed attempts never lock you out. Turn it off for the real demo.")
     if REQUIRE_APPROVAL:

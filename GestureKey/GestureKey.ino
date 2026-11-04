@@ -1,16 +1,18 @@
 //-------------------------------------------------------------------------------
 //  GestureKey - wrist-worn challenge-response authenticator (TinyScreen+)
 //
-//  Flow:
-//    1. Raspberry Pi (BLE central) writes  'C' + 16-byte random nonce  to the watch.
-//    2. Watch wakes and asks for the secret wrist gesture (3 flicks).
-//    3. Gesture is read from the BMA250 accelerometer and compared with the template.
-//    4. Match    -> watch notifies  'R' + first 16 bytes of HMAC-SHA256(key, 'A'+nonce)
-//       No match -> watch notifies  'N'  (denied)
-//    5. Pi verifies the HMAC, drives the servo lock, logs the attempt.
-//    Pi may also send 'L' (locked out) which the watch just displays.
-//    Pi sends 'T'+hour+min+sec to set the watch clock (the watch has no battery-backed RTC).
-//    Pi also sends 'S'+'U' (door unlocked) / 'S'+'K' (door locked) so the idle screen shows the door state.
+//  Flow (the laptop decides everything; the watch only judges the gesture):
+//    1. Laptop sends 'Q'. Watch answers 'Z'+wn (its own fresh nonce).
+//    2. Laptop sends 'C'+pn (its nonce) and 'M'+tag, proving it knows the shared key.
+//       The watch IGNORES any request that does not carry a valid proof (mutual authentication).
+//    3. Watch wakes and asks for the secret wrist gesture (3 flicks, direction AND rhythm).
+//    4. Match    -> watch notifies 'R'+tag_A(wn,pn), then shows "Checking..." until the laptop answers
+//       No match -> watch notifies 'N' (denied)
+//    5. Laptop verifies, applies approval/lockdown/hours rules, and opens the LOCK (a second TinyScreen+
+//       with the servo shield). The watch itself drives no lock.
+//    Laptop may also send: 'W'+secs (approve on phone), 'D'+code (N denied, T timed out, X phone
+//    unreachable, F lock error), 'L' (locked out), 'S'+'U'/'K' (door state), 'T'+h+m+s (clock).
+//    Tags are HMAC-SHA256 truncated to 16 bytes (see gk_auth.h).
 //
 //  ATTRIBUTION (the brief requires this - keep it in the video too):
 //    - BLE UART service (UART.ino, STBLE library): TinyCircuits ST BLE smartwatch
@@ -33,6 +35,8 @@
 #include <STBLE.h>
 #include "BMA250.h"
 #include "gk_crypto.h"
+#include "gk_auth.h"
+#include "gk_gesture.h"
 #include "secrets.h"
 
 #define BLE_DEBUG true
@@ -72,6 +76,14 @@ const unsigned long ENROL_WINDOW_MS     = 300000; // gesture can only be re-reco
 // 1 flick = 4 (guessable in a few tries), 3 flicks = 64. Keep at 3 or more for real use.
 const uint8_t       GESTURE_LEN         = 3;
 
+// Rhythm: the pauses between flicks are part of the secret too, so copying the directions by watching is not enough.
+// A pause matches if it is within max(RHYTHM_MIN_TOL_MS, RHYTHM_TOL_PCT % of the stored pause). Set USE_RHYTHM false to check directions only.
+const bool          USE_RHYTHM          = true;
+const uint16_t      RHYTHM_MIN_TOL_MS   = 350;
+const uint8_t       RHYTHM_TOL_PCT      = 40;
+const unsigned long AUTH_WINDOW_MS      = 5000;   // the laptop has this long to finish its proof after the watch hands out a nonce
+const unsigned long VERIFY_TIMEOUT_MS   = 30000;  // after a correct gesture, how long to wait for the laptop's verdict
+
 // ---- orientation (set these during calibration so UP/DOWN/LEFT/RIGHT match how the watch is worn) ----
 const bool SWAP_AXES = false;   // true if the board's X axis is your up/down axis
 const bool INVERT_H  = false;   // true if right/left come out reversed
@@ -83,6 +95,9 @@ enum { SYM_RIGHT = 0, SYM_LEFT = 1, SYM_UP = 2, SYM_DOWN = 3 };
 // Default gesture: RIGHT, RIGHT, DOWN.  Re-record with UPPER-LEFT button within 5 min of power-up.
 // (Kept in RAM only: the SAMD21 has no EEPROM, so it resets to this default on power cycle.)
 uint8_t gestureTemplate[GESTURE_LEN] = { SYM_RIGHT, SYM_RIGHT, SYM_DOWN };
+// Default rhythm: the pause (ms) after flick 1 and after flick 2. One entry per pause (GESTURE_LEN - 1); the last entry is unused.
+// Re-recorded together with the directions. Put your rehearsed values here to make them the default after a restart.
+uint16_t gestureGapMs[GESTURE_LEN] = { 1000, 1000 };
 
 // Debug aid: shows each detected flick direction on the watch. Set to false for the demo,
 // because it leaks the secret gesture.
@@ -107,10 +122,18 @@ char symChar(int8_t s) {
 }
 
 // ---- state machine ----
-enum State { ST_IDLE, ST_CHALLENGE, ST_ENROL, ST_RESULT };
+enum State { ST_IDLE, ST_CHALLENGE, ST_VERIFY, ST_ENROL, ST_RESULT };
 State state = ST_IDLE;
 
-uint8_t  nonce[16];
+uint8_t  wn[16], pn[16];              // watch nonce + laptop nonce of the CURRENT challenge
+uint8_t  wnNext[16], pnNext[16];      // handshake in progress: becomes current only after the laptop's proof checks out
+bool     authWait = false, havePn = false;
+unsigned long authSince = 0;
+uint32_t nonceCounter = 0;
+uint16_t enteredGapMs[GESTURE_LEN];   // pauses measured during this attempt
+unsigned long countdownMs = CHALLENGE_TIMEOUT_MS;   // length of the countdown currently shown
+unsigned long verifyLimitMs = VERIFY_TIMEOUT_MS;    // how long to wait for the laptop in ST_VERIFY
+bool     waitingPhone = false;        // true while the laptop is waiting for the owner's tap
 uint8_t  entered[GESTURE_LEN];
 uint8_t  enteredCount = 0;
 unsigned long lastStepTime = 0;
@@ -173,15 +196,15 @@ void showProgress(const char* title) {
              TS_8b_Yellow);
 }
 
-// Shows "Time left 12s" on the third line during a challenge. It redraws only that line
+// Shows "Time left 12s" (gesture) or "Approve in 20s" (phone) on the third line. It redraws only that line
 // (no clearScreen, no baseline reset), once per second, so it never disturbs flick detection.
 void drawCountdown() {
   unsigned long elapsed = millis() - stateStart;
-  uint8_t left = (elapsed >= CHALLENGE_TIMEOUT_MS) ? 0 : (uint8_t)((CHALLENGE_TIMEOUT_MS - elapsed + 999UL) / 1000UL);
+  uint8_t left = (elapsed >= countdownMs) ? 0 : (uint8_t)((countdownMs - elapsed + 999UL) / 1000UL);
   if (left == lastCountdownShown) return;
   lastCountdownShown = left;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "Time left %2ds ", (int)left);   // trailing space wipes leftover characters
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%s %2ds ", waitingPhone ? "Approve in" : "Time left", (int)left);   // trailing space wipes leftover characters
   display.setFont(font10pt);
   display.fontColor(left <= 3 ? TS_8b_Red : TS_8b_Gray, TS_8b_Black);   // turns red for the last 3 seconds
   display.setCursor(2, 42);
@@ -297,16 +320,10 @@ int8_t pollFlick() {
 // BLE protocol
 // ---------------------------------------------------------------------------
 void sendApproval() {
-  uint8_t msg[17];
-  msg[0] = 'A';
-  memcpy(msg + 1, nonce, 16);
-  uint8_t mac[32];
-  gk_hmac_sha256(GK_KEY, sizeof(GK_KEY), msg, sizeof(msg), mac);
-
-  uint8_t out[17];
+  uint8_t out[1 + GK_TAG_LEN];
   out[0] = 'R';
-  memcpy(out + 1, mac, 16);               // truncated to 128 bits so it fits one BLE packet
-  lib_aci_send_data(0, out, sizeof(out));  // notify on the RX characteristic (from UART.ino)
+  gk_tag_A(GK_KEY, sizeof(GK_KEY), wn, pn, out + 1);   // proves THIS gesture answered THIS pair of nonces
+  lib_aci_send_data(0, out, sizeof(out));              // notify on the RX characteristic (from UART.ino)
 }
 
 void sendDenied() {
@@ -314,38 +331,97 @@ void sendDenied() {
   lib_aci_send_data(0, out, 1);
 }
 
+void showResult(const char* l1, const char* l2, const char* l3, uint8_t color) {
+  state = ST_RESULT;
+  stateStart = millis();
+  waitingPhone = false;
+  wakeScreen();
+  showScreen(l1, l2, l3, color);
+}
+
+void startChallenge() {                       // the laptop has proven it knows the key
+  memcpy(wn, wnNext, GK_NONCE_LEN);
+  memcpy(pn, pnNext, GK_NONCE_LEN);
+  enteredCount = 0;
+  flickReset = true;
+  waitingPhone = false;
+  countdownMs = CHALLENGE_TIMEOUT_MS;
+  state = ST_CHALLENGE;
+  stateStart = millis();
+  wakeScreen();
+  buzz(80);
+  showProgress("Unlock? Flick");
+}
+
 void handleBleMessage() {
   if (!ble_rx_buffer_len) return;
   uint8_t type = ble_rx_buffer[0];
   uint8_t len  = ble_rx_buffer_len;
 
-  // Debug: shows in Arduino Serial Monitor (115200) for every packet from the Pi
+  // Debug: shows in Arduino Serial Monitor (115200) for every packet from the laptop
   SerialMonitorInterface.print("BLE rx type=");
   SerialMonitorInterface.print((char)((type >= 32 && type < 127) ? type : '?'));
   SerialMonitorInterface.print(" len=");
   SerialMonitorInterface.println(len);
 
-  if (type == 'C' && len == 17 && state != ST_ENROL) {
-    memcpy(nonce, ble_rx_buffer + 1, 16);   // copy at once: the buffer is overwritten by the next write
-    enteredCount = 0;
-    flickReset = true;
-    state = ST_CHALLENGE;
-    stateStart = millis();
-    wakeScreen();
-    buzz(80);
-    showProgress("Unlock? Flick");
+  if (type == 'Q' && len == 1) {
+    // Laptop asks for a nonce. Written to wnNext, so a challenge already in progress is never disturbed.
+    gk_make_nonce(GK_KEY, sizeof(GK_KEY), nonceCounter++, micros(), millis(), wnNext);
+    authWait = true; havePn = false; authSince = millis();
+    uint8_t out[1 + GK_NONCE_LEN];
+    out[0] = 'Z';
+    memcpy(out + 1, wnNext, GK_NONCE_LEN);
+    lib_aci_send_data(0, out, sizeof(out));
+  } else if (type == 'C' && len == 1 + GK_NONCE_LEN) {
+    // Laptop's nonce. Only taken while a handshake we started is open; otherwise silently dropped.
+    if (authWait && millis() - authSince <= AUTH_WINDOW_MS) { memcpy(pnNext, ble_rx_buffer + 1, GK_NONCE_LEN); havePn = true; }
+  } else if (type == 'M' && len == 1 + GK_TAG_LEN) {
+    // Laptop's proof that it knows the key. A nonce is used once, whether the proof is good or not.
+    bool ok = false;
+    if (authWait && havePn && state != ST_ENROL && millis() - authSince <= AUTH_WINDOW_MS) {
+      uint8_t expect[GK_TAG_LEN];
+      gk_tag_P(GK_KEY, sizeof(GK_KEY), wnNext, pnNext, expect);
+      ok = gk_ct_equal(expect, ble_rx_buffer + 1, GK_TAG_LEN) != 0;
+    }
+    authWait = false; havePn = false;
+    if (ok) startChallenge();
+    else SerialMonitorInterface.println("auth: proof rejected, request ignored");   // no screen change: strangers get no reaction
+  } else if (type == 'W' && len == 2) {
+    // Laptop: gesture accepted, now waiting for the owner to tap Approve on the phone. ble_rx_buffer[1] = seconds.
+    if (state == ST_VERIFY) {
+      waitingPhone = true;
+      countdownMs = (unsigned long)ble_rx_buffer[1] * 1000UL;
+      verifyLimitMs = countdownMs + 8000UL;            // grace for the laptop's final message
+      stateStart = millis();
+      wakeScreen();
+      showScreen("Approve on", "your phone", "", TS_8b_Yellow);
+    }
+  } else if (type == 'D' && len == 2) {
+    // Laptop's decision after a correct gesture that did not lead to an unlock
+    if (state == ST_VERIFY) {
+      switch (ble_rx_buffer[1]) {
+        case 'N': showResult("DENIED", "Owner said no", "", TS_8b_Red); buzz(300); break;
+        case 'T': showResult("TIMED OUT", "No approval", "", TS_8b_Gray); break;
+        case 'X': showResult("NOT APPROVED", "Phone unreachable", "", TS_8b_Red); break;
+        case 'F': showResult("LOCK ERROR", "Door not opened", "", TS_8b_Red); buzz(300); break;
+        default:  showResult("NOT APPROVED", "Laptop said no", "", TS_8b_Red); break;
+      }
+    }
   } else if (type == 'S' && len == 2) {
-    // Door status from the Pi: 'U' = unlocked, 'K' = locked
+    // Door status from the laptop: 'U' = unlocked, 'K' = locked
     DoorState prev = doorState;
     doorState = (ble_rx_buffer[1] == 'U') ? DOOR_UNLOCKED : DOOR_LOCKED;
     if (doorState == DOOR_UNLOCKED && prev != DOOR_UNLOCKED && timeKnown) lastUnlockSec = (int32_t)nowSec();
-    if (state == ST_IDLE) {              // never interrupt a gesture or a result screen; the idle redraw shows it later
+    if (state == ST_VERIFY && doorState == DOOR_UNLOCKED) {      // the laptop opened the lock: this is the real "approved"
+      showResult("APPROVED", "Door unlocking", "", TS_8b_Green);
+      buzz(80);
+    } else if (state == ST_IDLE) {       // never interrupt a gesture or a result screen; the idle redraw shows it later
       wakeScreen();
       showIdle();
       if (doorState == DOOR_UNLOCKED && prev != DOOR_UNLOCKED) { buzz(60); delay(80); buzz(60); }   // double pulse
     }
   } else if (type == 'T' && len == 4) {
-    // Clock sync from the Pi: hour, minute, second
+    // Clock sync from the laptop: hour, minute, second
     if (ble_rx_buffer[1] < 24 && ble_rx_buffer[2] < 60 && ble_rx_buffer[3] < 60) {
       timeBaseSec = ble_rx_buffer[1] * 3600UL + ble_rx_buffer[2] * 60UL + ble_rx_buffer[3];
       timeBaseMs = millis();
@@ -353,18 +429,12 @@ void handleBleMessage() {
       if (state == ST_IDLE && displayOn) showIdle();     // update the clock without waking the screen
     }
   } else if (type == 'L') {
-    state = ST_RESULT;
-    stateStart = millis();
-    wakeScreen();
-    showScreen("LOCKED OUT", "Too many", "failed tries", TS_8b_Red);
+    showResult("LOCKED OUT", "Too many", "failed tries", TS_8b_Red);
   } else {
-    // Packet arrived but was not a valid challenge: say so on screen instead of ignoring silently
+    // Packet we do not understand: say so on screen instead of ignoring silently
     char l2[24];
     snprintf(l2, sizeof(l2), "type=%c len=%d", (type >= 32 && type < 127) ? (char)type : '?', len);
-    state = ST_RESULT;
-    stateStart = millis();
-    wakeScreen();
-    showScreen("RX ignored", l2, (type == 'C' && len == 17) ? "enrol mode?" : "expect C,17", TS_8b_Yellow);
+    showResult("RX ignored", l2, "unknown message", TS_8b_Yellow);
   }
   ble_rx_buffer_len = 0;
 }
@@ -373,9 +443,10 @@ void handleBleMessage() {
 // State handling
 // ---------------------------------------------------------------------------
 bool gestureMatches() {
-  uint8_t diff = 0;                        // accumulate differences, no early exit
-  for (uint8_t i = 0; i < GESTURE_LEN; i++) diff |= (entered[i] ^ gestureTemplate[i]);
-  return diff == 0;
+  // Both checks always run, so the time taken never reveals which part failed (and the screen says only "Wrong gesture").
+  int dirs   = gk_dirs_match(gestureTemplate, entered, GESTURE_LEN);
+  int rhythm = USE_RHYTHM ? gk_rhythm_match(gestureGapMs, enteredGapMs, GESTURE_LEN - 1, RHYTHM_MIN_TOL_MS, RHYTHM_TOL_PCT) : 1;
+  return dirs && rhythm;
 }
 
 void finishResult(bool ok) {
@@ -383,7 +454,12 @@ void finishResult(bool ok) {
   stateStart = millis();
   if (ok) {
     sendApproval();
-    showScreen("APPROVED", "Door unlocking", "", TS_8b_Green);
+    // Not "approved" yet: the laptop still has to check, apply its rules and open the lock.
+    waitingPhone = false;
+    countdownMs = VERIFY_TIMEOUT_MS;
+    verifyLimitMs = VERIFY_TIMEOUT_MS;
+    state = ST_VERIFY;
+    showScreen("Gesture OK", "Checking...", "", TS_8b_Green);
     buzz(80);
   } else {
     sendDenied();
@@ -400,6 +476,10 @@ void onFlick(int8_t sym) {
 
   // A long pause means the person restarted the gesture
   if (enteredCount > 0 && millis() - lastStepTime > STEP_TIMEOUT_MS) enteredCount = 0;
+  if (enteredCount > 0) {                       // pause since the previous flick = the rhythm
+    unsigned long gap = millis() - lastStepTime;
+    enteredGapMs[enteredCount - 1] = (gap > 65535UL) ? 65535 : (uint16_t)gap;
+  }
   entered[enteredCount++] = sym;
   lastStepTime = millis();
 
@@ -409,6 +489,7 @@ void onFlick(int8_t sym) {
   } else if (state == ST_ENROL) {
     if (enteredCount < GESTURE_LEN) { showProgress("Enrol: flick"); return; }
     memcpy(gestureTemplate, entered, GESTURE_LEN);
+    memcpy(gestureGapMs, enteredGapMs, sizeof(gestureGapMs));      // the rhythm is saved together with the directions
     state = ST_RESULT;
     stateStart = millis();
     showScreen("SAVED", "New gesture", "stored in RAM", TS_8b_Green);
@@ -472,6 +553,10 @@ void loop() {
         stateStart = millis();
         showScreen("TIMED OUT", "No gesture", "", TS_8b_Gray);
       }
+      break;
+    case ST_VERIFY:
+      if (waitingPhone) drawCountdown();
+      if (millis() - stateStart > verifyLimitMs) showResult("NO REPLY", "from laptop", "", TS_8b_Gray);
       break;
     case ST_RESULT:
       if (millis() - stateStart > RESULT_SHOW_MS) { state = ST_IDLE; showIdle(); }
