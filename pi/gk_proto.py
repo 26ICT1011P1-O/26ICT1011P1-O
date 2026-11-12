@@ -16,7 +16,10 @@ make every tag single-use.
           or 'N'                  wrong gesture
   laptop  'W' + seconds           waiting for phone approval
   laptop  'D' + code              decision: N denied, T timed out, X phone unreachable, F lock error
-  laptop  'L' / 'T' h m s / 'S' U|K    locked-out notice / clock / door status (display only)
+  laptop  'L' + seconds               locked out, with a live countdown on the watch (a bare 'L' still works)
+  laptop  'B' + reason [+ data]       refused before a challenge: D lockdown, H + start + end hour, K lock offline
+  laptop  'T' h m s / 'S' U|K         clock / door status (display only)
+  (All of 'W' 'D' 'L' 'B' 'T' 'S' only change what the watch SHOWS. They are not authenticated and never open the door.)
 """
 import hmac, hashlib, os
 
