@@ -318,7 +318,7 @@ Adjust `FLICK_THRESHOLD` and the settle settings until detection is reliable. De
 1.0 s pauses. Re-record with the upper-left button within 5 minutes of power-up.
 
 ## Limitations
-Be upfront about these in the video.
+
 - **One shared key** in the watch, the lock and the laptop: extracting it from any one device (for example the
   flash of a lost watch) compromises all three. A real product would use a key per device and protected storage.
 - **Re-enrolment:** anyone holding the watch can re-record the gesture in the first 5 minutes after power-up. The
@@ -352,8 +352,6 @@ Team P1O, ICT1011 Team Exploration Project.
 | Lionel Cheak | Filmed and edited the video. |
 | Haziq Rifai | Wrote the video script. |
 | JJ | Presented in the video. |
-
-Commit your own work under your own name so the history shows who did what.
 
 ## References
 Background reading for the design. These are cited for ideas only; none of their code is used.
