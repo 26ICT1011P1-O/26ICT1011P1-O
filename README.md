@@ -346,12 +346,12 @@ Team P1O, ICT1011 Team Exploration Project.
 
 | Member | Contribution |
 |---|---|
-| Jonathan New | Hardware build, laptop controller, merging, repo, README |
-| Yuan Yee | Calibration, lockout screens, proximity mode, virtual door |
-| Kieran Lee | 3D printing of the watch casing |
-| Lionel Cheak | Filming and editing the project video |
-| Haziq Rifai | Video script |
-| JJ | (fill in) |
+| Jonathan New | Built the hardware and laptop controller. |
+| Yuan Yee | Wrote calibration, lockout screens and the virtual door. |
+| Kieran Lee | 3D printed the watch casing. |
+| Lionel Cheak | Filmed and edited the video. |
+| Haziq Rifai | Wrote the video script. |
+| JJ | Presented in the video. |
 
 Commit your own work under your own name so the history shows who did what.
 
