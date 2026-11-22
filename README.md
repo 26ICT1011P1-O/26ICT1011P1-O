@@ -243,7 +243,7 @@ python -m unittest discover -s tests -v
   Bluetooth names, no Pin-9 reset, no debug display left on.
   It cannot prove the sketches work on the real boards.
 
-## Proximity mode and the on-screen door (added by Yuan Yee)
+## Proximity mode and the on-screen door (added by Sim Yuan Yee)
 - **`GK_AUTO=1`** removes the Enter key: the laptop scans the watch's Bluetooth adverts, and when the signal is strong
   enough it connects (to the lock stack too, in `ble` mode) and runs the normal unlock check by itself.
 - Distance is judged from signal strength in dBm (closer to 0 = nearer). It is noisy and depends on walls, bodies
@@ -282,7 +282,7 @@ python -m unittest discover -s tests -v
 - `L` and `B` are display-only messages, like `S`, `T`, `W` and `D`: they change what the watch shows and can never
   open anything.
 
-## Calibration (upper-right button) - added by Yuan Yee
+## Calibration (upper-right button) - added by Sim Yuan Yee
 Different people wear and flick the watch differently, which shows up as "wrong gesture" even when the gesture was
 right. Calibration fixes that for the person wearing it:
 1. At the idle screen, press the **upper-right** button. The screen says `Calibrate / Flick RIGHT / 1 of 3`.
@@ -318,7 +318,7 @@ Adjust `FLICK_THRESHOLD` and the settle settings until detection is reliable. De
 1.0 s pauses. Re-record with the upper-left button within 5 minutes of power-up.
 
 ## Limitations
-
+Be upfront about these in the video.
 - **One shared key** in the watch, the lock and the laptop: extracting it from any one device (for example the
   flash of a lost watch) compromises all three. A real product would use a key per device and protected storage.
 - **Re-enrolment:** anyone holding the watch can re-record the gesture in the first 5 minutes after power-up. The
@@ -346,12 +346,14 @@ Team P1O, ICT1011 Team Exploration Project.
 
 | Member | Contribution |
 |---|---|
-| Jonathan New | Built the hardware and laptop controller. |
-| Yuan Yee | Wrote calibration, lockout screens and the virtual door. |
-| Kieran Lee | 3D printed the watch casing. |
-| Lionel Cheak | Filmed and edited the video. |
-| Haziq Rifai | Wrote the video script. |
-| JJ | Presented in the video. |
+| Jonathan New Kah Hwee | TinyScreen setup, Telegram bot, servo motor |
+| Sim Yuan Yee | Lock features |
+| Muhammad Haziq Rifai Bin Sohan | TinyScreen setup, screenwriting, YouTube |
+| Ng Jian Jian | Screenwriting, 3D printing, YouTube |
+| Kieran Lee Teck Hong | 3D printing, YouTube |
+| Cheak Jun Jie Lionel | Editing, 3D printing, YouTube |
+
+Commit your own work under your own name so the history shows who did what.
 
 ## References
 Background reading for the design. These are cited for ideas only; none of their code is used.
@@ -379,9 +381,9 @@ secret flick sequence, so these are context, not a claim of equivalence)
 
 ## Attribution
 - Calibration, the lockout countdown, the refusal screens and the haptic ticks (`GestureKey.ino`, plus `send_lockout_left`
-  and `send_blocked` in `gk_lock.py`): written by Yuan Yee. Two small fixes were made when merging:
+  and `send_blocked` in `gk_lock.py`): written by Sim Yuan Yee. Two small fixes were made when merging:
   calibration is now cancelled cleanly if anything interrupts it, and an end hour of 24 is displayed.
-- Proximity mode (`GK_AUTO`) and `virtual_door.py`: written by Yuan Yee; adapted to the two-stack
+- Proximity mode (`GK_AUTO`) and `virtual_door.py`: written by Sim Yuan Yee; adapted to the two-stack
   version of `gk_lock.py`.
 - BLE UART service and example structure: TinyCircuits ST BLE SmartWatch example
 - BMA250 driver and TinyScreen library: TinyCircuits
