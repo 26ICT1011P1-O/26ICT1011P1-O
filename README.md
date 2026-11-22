@@ -346,11 +346,11 @@ Team P1O, ICT1011 Team Exploration Project.
 
 | Member | Contribution |
 |---|---|
-| Jonathan New Kah Hwee | Built and tested the two TinyScreen+ stacks (watch and lock unit), debugged the hardware (shared reset pin, servo, Bluetooth range), set up the laptop controller (HMAC check, Telegram approval, audit log), merged teammates' work, repository and this README |
-| Yuan Yee | Calibration, lockout countdown and refusal screens, haptic ticks, proximity mode and the virtual door |
-| Kieran Lee Teck Hong | 3D printing of the watch casing |
-| Cheak Jun Jie Lionel | Filming and editing the project video |
-| Muhammad Haziq Rifai Bin Sohan | Video script |
+| Jonathan New | Hardware build, laptop controller, merging, repo, README |
+| Yuan Yee | Calibration, lockout screens, proximity mode, virtual door |
+| Kieran Lee | 3D printing of the watch casing |
+| Lionel Cheak | Filming and editing the project video |
+| Haziq Rifai | Video script |
 | JJ | (fill in) |
 
 Commit your own work under your own name so the history shows who did what.
