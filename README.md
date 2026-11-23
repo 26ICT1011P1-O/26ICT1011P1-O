@@ -101,6 +101,12 @@ python gk_lock.py --scan        # should list GKey and GLock
 python gk_lock.py               # press Enter to request an unlock
 ```
 
+## Bluetooth range
+Run `python gk_lock.py --scan` and look at the `rssi` numbers (dBm, closer to 0 = stronger). The watch and the lock should
+both be around -40 to -65 when they are within a metre or two of the laptop. A device near -85 is heard only now and then,
+which shows up as "not found: lock". Move the kit closer, keep metal and the servo away from the antenna end, check its
+battery, and raise `GK_SCAN_S` if needed. In the demo room, put the laptop between the watch and the lock, or close to both.
+
 ## First-time test order (each step proves one thing)
 1. Upload TinyCircuits' own servo example to the lock stack: does the servo sweep? (hardware + power OK)
 2. Upload `LockKey.ino`: screen shows `GLock / LOCKED`. Run `python gk_lock.py --scan`: `GLock` appears.
@@ -267,6 +273,28 @@ python -m unittest discover -s tests -v
 - **During a challenge:** progress dots and a `Time left` countdown that turns red for the last 3 seconds.
   The countdown redraws only its own line, so it never disturbs flick detection.
 - The accelerometer is only read while a gesture is being entered, which saves battery.
+- **Feeling the flicks:** a short buzz for every flick that counted, and a quick double buzz when a movement was
+  ignored (too brief or too diagonal), so you can tell without looking.
+- **Lockout:** `LOCKED OUT / Try again in` with a live countdown. Trying again during a lockout shows the time left.
+- **Refused before a challenge:** `LOCKDOWN` (owner sent /lockdown), `CLOSED NOW / Open 07-23 h` (outside the allowed
+  hours), or `LOCK OFFLINE` (the lock stack is not connected). These only appear on the idle screen.
+- `L` and `B` are display-only messages, like `S`, `T`, `W` and `D`: they change what the watch shows and can never
+  open anything.
+
+## Calibration (upper-right button) - added by a teammate
+Different people wear and flick the watch differently, which shows up as "wrong gesture" even when the gesture was
+right. Calibration fixes that for the person wearing it:
+1. At the idle screen, press the **upper-right** button. The screen says `Calibrate / Flick RIGHT / 1 of 3`.
+2. Flick **RIGHT** three times, then **DOWN** twice, as you naturally would. Wait for the buzz between flicks.
+3. `CAL DONE` shows the new flick threshold and a code: `S` = axes swapped, `H` = left/right inverted, `V` = up/down
+   inverted (`-` = not). `CAL FAILED` or `TOO GENTLE` keeps the old settings; just try again. Any button cancels.
+
+Two things to know:
+- **Calibrate first, then enrol.** Calibration changes what counts as RIGHT, so a gesture recorded before calibrating
+  may no longer match. Power on, calibrate, then re-record your gesture (upper-left, within 5 minutes).
+- **It is not saved across a restart** (no EEPROM). To make it permanent, open the Serial Monitor (115200) while
+  calibrating, read the `CALIBRATION swap=... invertH=... invertV=... threshold=...` line, and put those values in
+  `SWAP_AXES`, `INVERT_H`, `INVERT_V` and `FLICK_THRESHOLD` at the top of `GestureKey.ino`, then upload.
 
 ## Gesture tips (how the detector behaves)
 - Wait for the buzz and the `Unlock? Flick` screen, then flick. Motion in the first half second after
@@ -295,6 +323,8 @@ Be upfront about these in the video.
 - **Re-enrolment:** anyone holding the watch can re-record the gesture in the first 5 minutes after power-up. The
   laptop still has to approve, but a stolen watch with a new gesture is a stolen watch that unlocks for its thief
   if the thief can also pass the laptop's rules. Do not rely on the enrol window for security.
+- **Calibration** can be started by anyone holding the watch. It cannot unlock anything or change the secret gesture,
+  but a bad calibration can make the owner's gesture fail until it is redone (or the watch restarted).
 - **Gesture memory:** the gesture lives in RAM (no EEPROM shield), so it returns to the default in the code after a
   restart. Put your rehearsed values in the code as the default.
 - **Weak guessing resistance:** 64 direction combinations times a few bits of rhythm is a few hundred possibilities.
@@ -350,6 +380,9 @@ secret flick sequence, so these are context, not a claim of equivalence)
   https://www.dfki.de/web/forschung/projekte-publikationen/publikation/8163
 
 ## Attribution
+- Calibration, the lockout countdown, the refusal screens and the haptic ticks (`GestureKey.ino`, plus `send_lockout_left`
+  and `send_blocked` in `gk_lock.py`): written by a teammate (add their name). Two small fixes were made when merging:
+  calibration is now cancelled cleanly if anything interrupts it, and an end hour of 24 is displayed.
 - Proximity mode (`GK_AUTO`) and `virtual_door.py`: written by a teammate (add their name); adapted to the two-stack
   version of `gk_lock.py`.
 - BLE UART service and example structure: TinyCircuits ST BLE SmartWatch example
