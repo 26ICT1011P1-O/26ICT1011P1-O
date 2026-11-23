@@ -349,7 +349,7 @@ Team P1O, ICT1011 Team Exploration Project.
 | Jonathan New Kah Hwee | TinyScreen setup, Telegram bot, servo motor |
 | Sim Yuan Yee | Lock features |
 | Muhammad Haziq Rifai Bin Sohan | TinyScreen setup, screenwriting, YouTube |
-| Ng Jian Jian | Screenwriting, 3D printing, YouTube |
+| Ng Jia Jian | Screenwriting, 3D printing, YouTube |
 | Kieran Lee Teck Hong | 3D printing, YouTube |
 | Cheak Jun Jie Lionel | Editing, 3D printing, YouTube |
 
