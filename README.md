@@ -60,7 +60,7 @@ pi/                    LAPTOP program (named "pi" because it was designed for a 
 ## Hardware
 | Stack | Parts |
 |---|---|
-| **Watch** (kit 1) | TinyScreen+, Accelerometer TinyShield, ST BLE TinyShield, 150 mAh battery, micro-USB |
+| **Watch** (kit 1) | TinyScreen+, Accelerometer TinyShield, ST BLE TinyShield, 150 mAh battery, micro-USB, 3D-printed watch casing |
 | **Lock** (kit 2) | TinyScreen+, ST BLE TinyShield, **Servo TinyShield (ASD2303-R)**, **servo ES9251** (plugs into the shield's 3-pin connector), a **separate battery** on the shield's 2-pin power connector (not the stack's own), micro-USB, 3D-printed latch bracket |
 | **Laptop** | Bluetooth, Python 3.10 or newer |
 
@@ -149,7 +149,7 @@ upper-left button within 5 minutes of power-up, note what you did, and put the s
 and the same pauses (in ms) in `gestureGapMs` in `GestureKey.ino`.
 
 ## Telegram bot
-The Pi sends Telegram alerts, accepts a few commands, and can require your approval as a second factor.
+The laptop controller sends Telegram alerts, accepts a few commands, and can require your approval as a second factor.
 
 **Settings go in `pi/.env`** (copy `pi/.env.example`; it is git-ignored). Real environment variables
 override it. Never commit the token.
@@ -187,7 +187,8 @@ After a correct gesture and a valid HMAC, the bot sends "Unlock requested. Appro
   network can then bypass the second factor. Leave it off unless you accept that.
 - The script refuses to start if approval is on but Telegram is not configured, the listener is off, or
   the chat id is a group (negative number). It never silently runs with weaker security than you asked for.
-- Note: the watch already shows "APPROVED" after the gesture, before you tap Approve on your phone.
+- The watch shows `Gesture OK / Checking...`, then `Approve on your phone` with a countdown, and only shows `APPROVED`
+  once the laptop has actually opened the lock. A refusal shows `DENIED`, `TIMED OUT`, `NOT APPROVED` or `LOCK ERROR`.
 
 **Security of commands and buttons:** a bot username is public, so anyone can message it. Commands are
 obeyed **only** from the chat id in `TELEGRAM_CHAT_ID`; every other chat is ignored with no reply. Button
@@ -242,7 +243,7 @@ python -m unittest discover -s tests -v
   Bluetooth names, no Pin-9 reset, no debug display left on.
   It cannot prove the sketches work on the real boards.
 
-## Proximity mode and the on-screen door (added by a teammate)
+## Proximity mode and the on-screen door (added by Sim Yuan Yee)
 - **`GK_AUTO=1`** removes the Enter key: the laptop scans the watch's Bluetooth adverts, and when the signal is strong
   enough it connects (to the lock stack too, in `ble` mode) and runs the normal unlock check by itself.
 - Distance is judged from signal strength in dBm (closer to 0 = nearer). It is noisy and depends on walls, bodies
@@ -268,8 +269,8 @@ python -m unittest discover -s tests -v
 - **Clock and door status on the watch** are sent automatically on connect and after every unlock.
 
 ## What the watch shows
-- **Idle screen:** the clock (set by the Pi on connect and after every unlock), the door state
-  (green `UNLOCKED` / red `LOCKED`, shown once the Pi is connected) and the time of the last unlock.
+- **Idle screen:** the clock (set by the laptop on connect and after every unlock), the door state
+  (green `UNLOCKED` / red `LOCKED`, shown once the laptop is connected) and the time of the last unlock.
 - **During a challenge:** progress dots and a `Time left` countdown that turns red for the last 3 seconds.
   The countdown redraws only its own line, so it never disturbs flick detection.
 - The accelerometer is only read while a gesture is being entered, which saves battery.
@@ -281,7 +282,7 @@ python -m unittest discover -s tests -v
 - `L` and `B` are display-only messages, like `S`, `T`, `W` and `D`: they change what the watch shows and can never
   open anything.
 
-## Calibration (upper-right button) - added by a teammate
+## Calibration (upper-right button) - added by Sim Yuan Yee
 Different people wear and flick the watch differently, which shows up as "wrong gesture" even when the gesture was
 right. Calibration fixes that for the person wearing it:
 1. At the idle screen, press the **upper-right** button. The screen says `Calibrate / Flick RIGHT / 1 of 3`.
@@ -341,17 +342,16 @@ Be upfront about these in the video.
 - **The latch is a demo.** A 2.5 g servo cannot resist being forced.
 
 ## Team and contributions
-Credit each person for what they built. Example: the watch clock, the door-status display and the
-allowed-hours rule were added by a teammate (add their name below).
+Team P1O, ICT1011 Team Exploration Project.
 
-| Member | Area |
+| Member | Contribution |
 |---|---|
-| | Watch UI and firmware |
-| | Gesture engine |
-| | Crypto and BLE protocol |
-| | Laptop controller (`pi/`), proximity mode, on-screen door |
-| | Hardware and 3D printing |
-| | Dashboard, video, submission |
+| Jonathan New Kah Hwee | TinyScreen setup, Telegram bot, servo motor |
+| Sim Yuan Yee | Lock features |
+| Muhammad Haziq Rifai Bin Sohan | TinyScreen setup, screenwriting, YouTube |
+| Ng Jia Jian | Screenwriting, 3D printing, YouTube |
+| Kieran Lee Teck Hong | 3D printing, YouTube |
+| Cheak Jun Jie Lionel | Editing, 3D printing, YouTube |
 
 Commit your own work under your own name so the history shows who did what.
 
@@ -381,9 +381,9 @@ secret flick sequence, so these are context, not a claim of equivalence)
 
 ## Attribution
 - Calibration, the lockout countdown, the refusal screens and the haptic ticks (`GestureKey.ino`, plus `send_lockout_left`
-  and `send_blocked` in `gk_lock.py`): written by a teammate (add their name). Two small fixes were made when merging:
+  and `send_blocked` in `gk_lock.py`): written by Sim Yuan Yee. Two small fixes were made when merging:
   calibration is now cancelled cleanly if anything interrupts it, and an end hour of 24 is displayed.
-- Proximity mode (`GK_AUTO`) and `virtual_door.py`: written by a teammate (add their name); adapted to the two-stack
+- Proximity mode (`GK_AUTO`) and `virtual_door.py`: written by Sim Yuan Yee; adapted to the two-stack
   version of `gk_lock.py`.
 - BLE UART service and example structure: TinyCircuits ST BLE SmartWatch example
 - BMA250 driver and TinyScreen library: TinyCircuits
